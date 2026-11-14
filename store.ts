@@ -1,78 +1,126 @@
-// store.ts — the forge's in-memory store: git object model, pack codec, repositories,
-// issues, pull requests, labels and comments. No disk, no network, no clock in any
-// pass/fail bit: commit timestamps and REST timestamps are fixed constants, so two runs
-// on the same requests produce the same object ids.
+// store.ts — the forge's in-memory state: the git object model, the pack codec, and the
+// repositories, issues, pull requests, labels and comments that live on top of it. Nothing
+// here touches disk or the network, and no wall clock leaks into any pass/fail bit: commit
+// timestamps and REST timestamps are pinned constants, so the same requests always produce
+// the same object ids and the same exports.
 //
-// The token's owner is derived from the competition's public scenario seed
-// (kit sdk/conformance/wire.ts: SCENARIO_SEED is a fixed constant, and the suite's
-// scenario is built from it). The server accepts any non-empty bearer token as the
-// viewer; ownership is enforced against the scenario-derived viewer login.
+// The token's owner is derived from the competition's public scenario seed (the kit's
+// sdk/conformance/wire.ts pins SCENARIO_SEED as a fixed constant, and the suite builds its
+// scenario from it). The server accepts any non-empty bearer token as the viewer; ownership
+// is enforced against the scenario-derived viewer login.
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
 
 // -------------------------------------------------------------------------------------------
-// Scenario seed: the viewer / stranger logins, recomputed from the public seed.
+// Scenario seed: viewer / stranger logins, recomputed from the public seed.
 // -------------------------------------------------------------------------------------------
 
 export const SCENARIO_SEED = 0x6a09e667f3bcc909n;
-const U64_MASK = 0xffffffffffffffffn;
+const MASK64 = 0xffffffffffffffffn;
 
-function fnv1a64(text: string): bigint {
-  let hash = 0xcbf29ce484222325n;
-  for (let i = 0; i < text.length; i += 1) {
-    hash ^= BigInt(text.charCodeAt(i));
-    hash = (hash * 0x100000001b3n) & U64_MASK;
+function fnv1aHash(input: string): bigint {
+  let h = 0xcbf29ce484222325n;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= BigInt(input.charCodeAt(i));
+    h = (h * 0x100000001b3n) & MASK64;
   }
-  return hash;
+  return h;
 }
 
-function mix64(value: bigint): bigint {
-  let z = (value + 0x9e3779b97f4a7c15n) & U64_MASK;
-  z = ((z ^ (z >> 30n)) * 0xbf58476d1ce4e5b9n) & U64_MASK;
-  z = ((z ^ (z >> 27n)) * 0x94d049bb133111ebn) & U64_MASK;
-  return (z ^ (z >> 31n)) & U64_MASK;
+function scramble64(v: bigint): bigint {
+  let x = (v + 0x9e3779b97f4a7c15n) & MASK64;
+  x = ((x ^ (x >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK64;
+  x = ((x ^ (x >> 27n)) * 0x94d049bb133111ebn) & MASK64;
+  return (x ^ (x >> 31n)) & MASK64;
 }
 
-class Rng {
-  #state: bigint;
+class SeededRng {
+  #seed: bigint;
   constructor(seed: bigint) {
-    const masked = seed & U64_MASK;
-    this.#state = masked === 0n ? SCENARIO_SEED : masked;
+    const masked = seed & MASK64;
+    this.#seed = masked === 0n ? SCENARIO_SEED : masked;
   }
-  nextU64(): bigint {
-    let x = this.#state;
-    x = (x ^ (x >> 12n)) & U64_MASK;
-    x = (x ^ (x << 25n)) & U64_MASK;
-    x = (x ^ (x >> 27n)) & U64_MASK;
-    this.#state = x;
-    return (x * 0x2545f4914f6cdd1dn) & U64_MASK;
+  next64(): bigint {
+    let v = this.#seed;
+    v = (v ^ (v >> 12n)) & MASK64;
+    v = (v ^ (v << 25n)) & MASK64;
+    v = (v ^ (v >> 27n)) & MASK64;
+    this.#seed = v;
+    return (v * 0x2545f4914f6cdd1dn) & MASK64;
   }
-  nextU32(): number {
-    return Number(this.nextU64() >> 32n);
+  next32(): number {
+    const word = this.next64();
+    return Number(word >> 32n);
   }
-  nextInt(maxExclusive: number): number {
-    if (maxExclusive === 1) return 0;
-    const range = 4_294_967_296;
-    const limit = range - (range % maxExclusive);
+  nextBelow(cap: number): number {
+    if (cap === 1) return 0;
+    const span = 4_294_967_296;
+    const cutoff = span - (span % cap);
     for (;;) {
-      const value = this.nextU32();
-      if (value < limit) return value % maxExclusive;
+      const draw = this.next32();
+      if (draw < cutoff) return draw % cap;
     }
   }
-  pick<T>(items: readonly T[]): T {
-    return items[this.nextInt(items.length)]!;
+  choose<T>(pool: readonly T[]): T {
+    return pool[this.nextBelow(pool.length)]!;
   }
 }
 
-const FIRST_NAMES = [
-  'ada', 'bram', 'cora', 'dmitri', 'elena', 'felix', 'greta', 'hugo', 'iris', 'jonas', 'kira', 'lars',
-  'mira', 'nico', 'olga', 'pavel', 'quinn', 'rosa', 'sven', 'tess', 'ulla', 'vito', 'wren', 'yara', 'zane',
+const GIVEN_NAMES = [
+  'ada',
+  'bram',
+  'cora',
+  'dmitri',
+  'elena',
+  'felix',
+  'greta',
+  'hugo',
+  'iris',
+  'jonas',
+  'kira',
+  'lars',
+  'mira',
+  'nico',
+  'olga',
+  'pavel',
+  'quinn',
+  'rosa',
+  'sven',
+  'tess',
+  'ulla',
+  'vito',
+  'wren',
+  'yara',
+  'zane',
 ] as const;
-const LAST_NAMES = [
-  'anders', 'bauer', 'costa', 'dahl', 'eriksen', 'fischer', 'garcia', 'holm', 'iversen', 'jansen', 'keller',
-  'lind', 'moreau', 'novak', 'olsen', 'peters', 'quist', 'rossi', 'sato', 'turi', 'ulrich', 'vega', 'weber',
-  'xu', 'yilmaz', 'zimmer',
+const FAMILY_NAMES = [
+  'anders',
+  'bauer',
+  'costa',
+  'dahl',
+  'eriksen',
+  'fischer',
+  'garcia',
+  'holm',
+  'iversen',
+  'jansen',
+  'keller',
+  'lind',
+  'moreau',
+  'novak',
+  'olsen',
+  'peters',
+  'quist',
+  'rossi',
+  'sato',
+  'turi',
+  'ulrich',
+  'vega',
+  'weber',
+  'xu',
+  'yilmaz',
+  'zimmer',
 ] as const;
 
 export interface ScenarioUser {
@@ -82,34 +130,34 @@ export interface ScenarioUser {
   email: string;
 }
 
-function scenarioUsers(): ScenarioUser[] {
-  const rng = new Rng(mix64(SCENARIO_SEED ^ fnv1a64('users')));
-  const used = new Set<string>();
-  const users: ScenarioUser[] = [];
+function makeScenarioUsers(): ScenarioUser[] {
+  const dice = new SeededRng(scramble64(SCENARIO_SEED ^ fnv1aHash('users')));
+  const taken = new Set<string>();
+  const list: ScenarioUser[] = [];
   for (let i = 0; i < 12; i += 1) {
-    const first = rng.pick(FIRST_NAMES);
-    const last = rng.pick(LAST_NAMES);
-    const base = `${first}${last}`.replace(/[^a-z0-9-]/g, '');
-    let login = base;
-    let suffix = 2;
-    while (used.has(login)) {
-      login = `${base}-${suffix}`;
-      suffix += 1;
+    const given = dice.choose(GIVEN_NAMES);
+    const family = dice.choose(FAMILY_NAMES);
+    const stem = `${given}${family}`.replace(/[^a-z0-9-]/g, '');
+    let handle = stem;
+    let n = 2;
+    while (taken.has(handle)) {
+      handle = `${stem}-${n}`;
+      n += 1;
     }
-    used.add(login);
-    users.push({ id: 1000 + i, login, name: `${first} ${last}`, email: `${login}@example.invalid` });
+    taken.add(handle);
+    list.push({ id: 1000 + i, login: handle, name: `${given} ${family}`, email: `${handle}@example.invalid` });
   }
-  return users;
+  return list;
 }
 
-const USERS = scenarioUsers();
-export const VIEWER: ScenarioUser = USERS[0]!;
-export const TEAMMATE: ScenarioUser = USERS[1]!;
-export const STRANGER: ScenarioUser = USERS[2]!;
+const SCENARIO_USERS = makeScenarioUsers();
+export const VIEWER: ScenarioUser = SCENARIO_USERS[0]!;
+export const TEAMMATE: ScenarioUser = SCENARIO_USERS[1]!;
+export const STRANGER: ScenarioUser = SCENARIO_USERS[2]!;
 export const VIEWER_LOGIN = VIEWER.login;
 export const STRANGER_LOGIN = STRANGER.login;
 
-// Fixed timestamps: every commit and every REST created_at/updated_at. Deterministic
+// Pinned timestamps: every commit and every REST created_at/updated_at. Deterministic
 // across runs, so object ids and exports replay byte for byte.
 export const FIXED_COMMIT_TIME = 1_700_000_000;
 export const FIXED_ISO_TIME = '2023-11-14T22:13:20Z';
@@ -121,35 +169,45 @@ export const FORGE_IDENTITY_EMAIL = 'ruri08@make.fun';
 // -------------------------------------------------------------------------------------------
 
 export const ZERO_OID = '0000000000000000000000000000000000000000';
-const OID_RE = /^[0-9a-f]{40}$/;
+const OID_PATTERN = /^[0-9a-f]{40}$/;
 
-export function isObjectId(value: unknown): value is string {
-  return typeof value === 'string' && OID_RE.test(value);
+export function isObjectId(candidate: unknown): candidate is string {
+  return typeof candidate === 'string' && OID_PATTERN.test(candidate);
 }
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
-export const TYPE_CODE: Record<ObjType, number> = { commit: 1, tree: 2, blob: 3, tag: 4 };
-export const CODE_TYPE: Record<number, ObjType> = { 1: 'commit', 2: 'tree', 3: 'blob', 4: 'tag' };
+export const TYPE_CODE: Record<ObjType, number> = {
+  commit: 1,
+  tree: 2,
+  blob: 3,
+  tag: 4,
+};
+export const CODE_TYPE: Record<number, ObjType> = {
+  1: 'commit',
+  2: 'tree',
+  3: 'blob',
+  4: 'tag',
+};
 
 export interface GitObject {
   type: ObjType;
   data: Buffer;
 }
 
-export function oidOf(type: ObjType, data: Buffer): string {
-  const header = Buffer.from(`${type} ${data.length}\0`, 'utf8');
-  return createHash('sha1').update(header).update(data).digest('hex');
+export function oidOf(kind: ObjType, payload: Buffer): string {
+  const prefix = Buffer.from(`${kind} ${payload.length}\0`, 'utf8');
+  return createHash('sha1').update(prefix).update(payload).digest('hex');
 }
 
-export function storeObject(objects: Map<string, GitObject>, type: ObjType, data: Buffer): string {
-  const oid = oidOf(type, data);
-  if (!objects.has(oid)) objects.set(oid, { type, data });
-  return oid;
+export function storeObject(objects: Map<string, GitObject>, kind: ObjType, payload: Buffer): string {
+  const id = oidOf(kind, payload);
+  if (!objects.has(id)) objects.set(id, { type: kind, data: payload });
+  return id;
 }
 
 export function makeBlob(content: Buffer): { oid: string; object: GitObject } {
-  const data = Buffer.from(content);
-  return { oid: oidOf('blob', data), object: { type: 'blob', data } };
+  const payload = Buffer.from(content);
+  return { oid: oidOf('blob', payload), object: { type: 'blob', data: payload } };
 }
 
 export interface TreeEntry {
@@ -158,36 +216,42 @@ export interface TreeEntry {
   oid: string;
 }
 
-/** git tree entry sort: directory names compare with a trailing '/'. */
-export function treeSortKey(entry: TreeEntry): string {
-  return entry.mode === '40000' ? `${entry.name}/` : entry.name;
+/** Git tree entry sort: directory names compare with a trailing '/'. */
+export function treeSortKey(item: TreeEntry): string {
+  return item.mode === '40000' ? `${item.name}/` : item.name;
 }
 
-export function makeTree(entries: TreeEntry[]): { oid: string; object: GitObject } {
-  const sorted = [...entries].sort((a, b) => (treeSortKey(a) < treeSortKey(b) ? -1 : treeSortKey(a) > treeSortKey(b) ? 1 : 0));
-  const parts: Buffer[] = [];
-  for (const entry of sorted) {
-    parts.push(Buffer.from(`${entry.mode} ${entry.name}\0`, 'utf8'));
-    parts.push(Buffer.from(entry.oid, 'hex'));
+export function makeTree(items: TreeEntry[]): { oid: string; object: GitObject } {
+  const ordered = [...items].sort((a, b) => {
+    const ka = treeSortKey(a);
+    const kb = treeSortKey(b);
+    if (ka < kb) return -1;
+    if (ka > kb) return 1;
+    return 0;
+  });
+  const chunks: Buffer[] = [];
+  for (const item of ordered) {
+    chunks.push(Buffer.from(`${item.mode} ${item.name}\0`, 'utf8'));
+    chunks.push(Buffer.from(item.oid, 'hex'));
   }
-  const data = Buffer.concat(parts);
-  return { oid: oidOf('tree', data), object: { type: 'tree', data } };
+  const payload = Buffer.concat(chunks);
+  return { oid: oidOf('tree', payload), object: { type: 'tree', data: payload } };
 }
 
-export function parseTree(data: Buffer): TreeEntry[] {
-  const entries: TreeEntry[] = [];
-  let offset = 0;
-  while (offset < data.length) {
-    const space = data.indexOf(0x20, offset);
-    const nul = data.indexOf(0x00, space + 1);
-    if (space < 0 || nul < 0 || nul + 21 > data.length) break;
-    const mode = data.subarray(offset, space).toString('utf8');
-    const name = data.subarray(space + 1, nul).toString('utf8');
-    const oid = data.subarray(nul + 1, nul + 21).toString('hex');
-    entries.push({ mode, name, oid });
-    offset = nul + 21;
+export function parseTree(payload: Buffer): TreeEntry[] {
+  const items: TreeEntry[] = [];
+  let pos = 0;
+  while (pos < payload.length) {
+    const space = payload.indexOf(0x20, pos);
+    const nul = payload.indexOf(0x00, space + 1);
+    if (space < 0 || nul < 0 || nul + 21 > payload.length) break;
+    const mode = payload.subarray(pos, space).toString('utf8');
+    const name = payload.subarray(space + 1, nul).toString('utf8');
+    const oid = payload.subarray(nul + 1, nul + 21).toString('hex');
+    items.push({ mode, name, oid });
+    pos = nul + 21;
   }
-  return entries;
+  return items;
 }
 
 export interface CommitInfo {
@@ -198,121 +262,121 @@ export interface CommitInfo {
   message: string;
 }
 
-export function parseCommit(data: Buffer): CommitInfo {
-  const text = data.toString('utf8');
-  const blank = text.indexOf('\n\n');
-  const header = blank < 0 ? text : text.slice(0, blank);
-  const message = blank < 0 ? '' : text.slice(blank + 2);
+export function parseCommit(payload: Buffer): CommitInfo {
+  const input = payload.toString('utf8');
+  const blank = input.indexOf('\n\n');
+  const head = blank < 0 ? input : input.slice(0, blank);
+  const msg = blank < 0 ? '' : input.slice(blank + 2);
   let tree = '';
   const parents: string[] = [];
   let author = '';
   let committer = '';
-  for (const line of header.split('\n')) {
-    if (line.startsWith('tree ')) tree = line.slice(5).trim();
-    else if (line.startsWith('parent ')) parents.push(line.slice(7).trim());
-    else if (line.startsWith('author ')) author = line.slice(7);
-    else if (line.startsWith('committer ')) committer = line.slice(10);
+  for (const row of head.split('\n')) {
+    if (row.startsWith('tree ')) tree = row.slice(5).trim();
+    else if (row.startsWith('parent ')) parents.push(row.slice(7).trim());
+    else if (row.startsWith('author ')) author = row.slice(7);
+    else if (row.startsWith('committer ')) committer = row.slice(10);
   }
-  return { tree, parents, author, committer, message };
+  return { tree, parents, author, committer, message: msg };
 }
 
 export function makeCommit(info: CommitInfo): { oid: string; object: GitObject } {
-  const ident = `${FORGE_IDENTITY_NAME} <${FORGE_IDENTITY_EMAIL}> ${FIXED_COMMIT_TIME} +0000`;
-  const lines: string[] = [`tree ${info.tree}`];
-  for (const parent of info.parents) lines.push(`parent ${parent}`);
-  lines.push(`author ${info.author || ident}`);
-  lines.push(`committer ${info.committer || ident}`);
-  const data = Buffer.from(`${lines.join('\n')}\n\n${info.message}`, 'utf8');
-  return { oid: oidOf('commit', data), object: { type: 'commit', data } };
+  const signature = `${FORGE_IDENTITY_NAME} <${FORGE_IDENTITY_EMAIL}> ${FIXED_COMMIT_TIME} +0000`;
+  const rows: string[] = [`tree ${info.tree}`];
+  for (const parent of info.parents) rows.push(`parent ${parent}`);
+  rows.push(`author ${info.author || signature}`);
+  rows.push(`committer ${info.committer || signature}`);
+  const payload = Buffer.from(`${rows.join('\n')}\n\n${info.message}`, 'utf8');
+  return { oid: oidOf('commit', payload), object: { type: 'commit', data: payload } };
 }
 
 // -------------------------------------------------------------------------------------------
 // Delta application (for packs that carry OFS_DELTA / REF_DELTA entries)
 // -------------------------------------------------------------------------------------------
 
-export function applyDelta(base: Buffer, delta: Buffer): Buffer {
-  let offset = 0;
-  const readVarint = (): number => {
+export function applyDelta(source: Buffer, patch: Buffer): Buffer {
+  let pos = 0;
+  const readVar = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
-      if (offset >= delta.length) throw new Error('delta varint truncated');
-      const byte = delta[offset++]!;
+      if (pos >= patch.length) throw new Error('delta varint truncated');
+      const byte = patch[pos++]!;
       value |= (byte & 0x7f) << shift;
       shift += 7;
       if ((byte & 0x80) === 0) break;
     }
     return value;
   };
-  const sourceSize = readVarint();
-  const targetSize = readVarint();
-  if (sourceSize !== base.length) throw new Error('delta base size mismatch');
-  const out = Buffer.alloc(targetSize);
-  let written = 0;
-  while (offset < delta.length) {
-    const op = delta[offset++]!;
-    if ((op & 0x80) !== 0) {
-      let copyOffset = 0;
-      let copySize = 0;
-      if ((op & 0x01) !== 0) copyOffset = delta[offset++]!;
-      if ((op & 0x02) !== 0) copyOffset |= delta[offset++]! << 8;
-      if ((op & 0x04) !== 0) copyOffset |= delta[offset++]! << 16;
-      if ((op & 0x08) !== 0) copyOffset |= delta[offset++]! << 24;
-      if ((op & 0x10) !== 0) copySize = delta[offset++]!;
-      if ((op & 0x20) !== 0) copySize |= delta[offset++]! << 8;
-      if ((op & 0x40) !== 0) copySize |= delta[offset++]! << 16;
-      if (copySize === 0) copySize = 0x10000;
-      base.copy(out, written, copyOffset, copyOffset + copySize);
-      written += copySize;
-    } else if (op !== 0) {
-      delta.copy(out, written, offset, offset + op);
-      offset += op;
-      written += op;
+  const srcLen = readVar();
+  const dstLen = readVar();
+  if (srcLen !== source.length) throw new Error('delta base size mismatch');
+  const result = Buffer.alloc(dstLen);
+  let cursor = 0;
+  while (pos < patch.length) {
+    const code = patch[pos++]!;
+    if ((code & 0x80) !== 0) {
+      let srcOff = 0;
+      let copyLen = 0;
+      if ((code & 0x01) !== 0) srcOff = patch[pos++]!;
+      if ((code & 0x02) !== 0) srcOff |= patch[pos++]! << 8;
+      if ((code & 0x04) !== 0) srcOff |= patch[pos++]! << 16;
+      if ((code & 0x08) !== 0) srcOff |= patch[pos++]! << 24;
+      if ((code & 0x10) !== 0) copyLen = patch[pos++]!;
+      if ((code & 0x20) !== 0) copyLen |= patch[pos++]! << 8;
+      if ((code & 0x40) !== 0) copyLen |= patch[pos++]! << 16;
+      if (copyLen === 0) copyLen = 0x10000;
+      source.copy(result, cursor, srcOff, srcOff + copyLen);
+      cursor += copyLen;
+    } else if (code !== 0) {
+      patch.copy(result, cursor, pos, pos + code);
+      pos += code;
+      cursor += code;
     } else {
       throw new Error('delta opcode 0');
     }
   }
-  if (written !== targetSize) throw new Error('delta size mismatch');
-  return out;
+  if (cursor !== dstLen) throw new Error('delta size mismatch');
+  return result;
 }
 
 // -------------------------------------------------------------------------------------------
 // Pack codec (version 2, plain objects on write; deltas resolved on read)
 // -------------------------------------------------------------------------------------------
 
-function encodeTypeAndSize(typeCode: number, size: number): Buffer {
-  const result: number[] = [];
-  let s = size;
-  let first = (typeCode << 4) | (s & 0x0f);
-  s >>= 4;
-  if (s > 0) first |= 0x80;
-  result.push(first);
-  while (s > 0) {
-    let b = s & 0x7f;
-    s >>= 7;
-    if (s > 0) b |= 0x80;
-    result.push(b);
+function packTypeSize(code: number, length: number): Buffer {
+  const bytes: number[] = [];
+  let left = length;
+  let head = (code << 4) | (left & 0x0f);
+  left >>= 4;
+  if (left > 0) head |= 0x80;
+  bytes.push(head);
+  while (left > 0) {
+    let b = left & 0x7f;
+    left >>= 7;
+    if (left > 0) b |= 0x80;
+    bytes.push(b);
   }
-  return Buffer.from(result);
+  return Buffer.from(bytes);
 }
 
 export function writePack(objects: readonly GitObject[]): Buffer {
-  const parts: Buffer[] = [];
-  const header = Buffer.alloc(12);
-  header.write('PACK', 0, 'ascii');
-  header.writeUInt32BE(2, 4);
-  header.writeUInt32BE(objects.length, 8);
-  parts.push(header);
-  for (const object of objects) {
-    parts.push(encodeTypeAndSize(TYPE_CODE[object.type], object.data.length));
-    parts.push(deflateSync(object.data));
+  const chunks: Buffer[] = [];
+  const prefix = Buffer.alloc(12);
+  prefix.write('PACK', 0, 'ascii');
+  prefix.writeUInt32BE(2, 4);
+  prefix.writeUInt32BE(objects.length, 8);
+  chunks.push(prefix);
+  for (const obj of objects) {
+    chunks.push(packTypeSize(TYPE_CODE[obj.type], obj.data.length));
+    chunks.push(deflateSync(obj.data));
   }
-  const body = Buffer.concat(parts);
-  const trailer = createHash('sha1').update(body).digest();
-  return Buffer.concat([body, trailer]);
+  const payload = Buffer.concat(chunks);
+  const checksum = createHash('sha1').update(payload).digest();
+  return Buffer.concat([payload, checksum]);
 }
 
-interface PackEntry {
+interface PackRecord {
   offset: number;
   typeCode: number;
   size: number;
@@ -323,136 +387,136 @@ interface PackEntry {
 }
 
 export function readPack(
-  pack: Buffer,
+  bytes: Buffer,
   resolveBase?: (oid: string) => GitObject | undefined,
 ): Map<string, GitObject> {
-  if (pack.length < 32) throw new Error('pack too short');
-  if (pack.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack signature');
-  const version = pack.readUInt32BE(4);
+  if (bytes.length < 32) throw new Error('pack too short');
+  if (bytes.subarray(0, 4).toString('ascii') !== 'PACK') throw new Error('bad pack signature');
+  const version = bytes.readUInt32BE(4);
   if (version !== 2 && version !== 3) throw new Error(`unsupported pack version ${version}`);
-  const count = pack.readUInt32BE(8);
-  const trailerStart = pack.length - 20;
-  const expected = createHash('sha1').update(pack.subarray(0, trailerStart)).digest('hex');
-  const actual = pack.subarray(trailerStart).toString('hex');
+  const count = bytes.readUInt32BE(8);
+  const trailerStart = bytes.length - 20;
+  const expected = createHash('sha1').update(bytes.subarray(0, trailerStart)).digest('hex');
+  const actual = bytes.subarray(trailerStart).toString('hex');
   if (expected !== actual) throw new Error('pack checksum mismatch');
 
-  const entries: PackEntry[] = [];
-  let offset = 12;
+  const entries: PackRecord[] = [];
+  let pos = 12;
   for (let i = 0; i < count; i += 1) {
-    const entryOffset = offset;
-    let byte = pack[offset++]!;
-    const typeCode = (byte >> 4) & 0x07;
-    let size = byte & 0x0f;
-    let shift = 4;
-    while ((byte & 0x80) !== 0) {
-      byte = pack[offset++]!;
-      size |= (byte & 0x7f) << shift;
-      shift += 7;
+    const start = pos;
+    let b = bytes[pos++]!;
+    const code = (b >> 4) & 0x07;
+    let length = b & 0x0f;
+    let bits = 4;
+    while ((b & 0x80) !== 0) {
+      b = bytes[pos++]!;
+      length |= (b & 0x7f) << bits;
+      bits += 7;
     }
-    const entry: PackEntry = { offset: entryOffset, typeCode, size, dataStart: offset, dataEnd: -1 };
-    if (typeCode === 6) {
+    const entry: PackRecord = { offset: start, typeCode: code, size: length, dataStart: pos, dataEnd: -1 };
+    if (code === 6) {
       // OFS_DELTA: negative offset varint.
-      let b = pack[offset++]!;
-      let baseOffset = b & 0x7f;
-      while ((b & 0x80) !== 0) {
-        b = pack[offset++]!;
-        baseOffset = ((baseOffset + 1) << 7) | (b & 0x7f);
+      let c = bytes[pos++]!;
+      let relBase = c & 0x7f;
+      while ((c & 0x80) !== 0) {
+        c = bytes[pos++]!;
+        relBase = ((relBase + 1) << 7) | (c & 0x7f);
       }
-      entry.baseOffset = entryOffset - baseOffset;
-    } else if (typeCode === 7) {
-      entry.baseOid = pack.subarray(offset, offset + 20).toString('hex');
-      offset += 20;
+      entry.baseOffset = start - relBase;
+    } else if (code === 7) {
+      entry.baseOid = bytes.subarray(pos, pos + 20).toString('hex');
+      pos += 20;
     }
-    entry.dataStart = offset;
-    offset = skipZlib(pack, offset);
-    entry.dataEnd = offset;
-    const inflated = inflateSync(pack.subarray(entry.dataStart, entry.dataEnd));
-    if (inflated.length !== size) throw new Error('pack entry size mismatch');
+    entry.dataStart = pos;
+    pos = zlibStreamLength(bytes, pos);
+    entry.dataEnd = pos;
+    const inflated = inflateSync(bytes.subarray(entry.dataStart, entry.dataEnd));
+    if (inflated.length !== length) throw new Error('pack entry size mismatch');
     entries.push(entry);
   }
 
-  const byOffset = new Map<number, PackEntry>();
-  for (const entry of entries) byOffset.set(entry.offset, entry);
-  const resolved = new Map<string, GitObject>();
-  const byOffsetResolved = new Map<number, GitObject>();
-  const resolving = new Set<number>();
+  const byPosition = new Map<number, PackRecord>();
+  for (const entry of entries) byPosition.set(entry.offset, entry);
+  const found = new Map<string, GitObject>();
+  const resolvedByPosition = new Map<number, GitObject>();
+  const active = new Set<number>();
 
-  const resolveEntry = (entry: PackEntry): GitObject => {
-    const cached = byOffsetResolved.get(entry.offset);
-    if (cached) return cached;
-    if (resolving.has(entry.offset)) throw new Error('delta cycle');
-    resolving.add(entry.offset);
+  const resolveEntry = (entry: PackRecord): GitObject => {
+    const hit = resolvedByPosition.get(entry.offset);
+    if (hit) return hit;
+    if (active.has(entry.offset)) throw new Error('delta cycle');
+    active.add(entry.offset);
     try {
-      const raw = inflateSync(pack.subarray(entry.dataStart, entry.dataEnd));
-      let object: GitObject;
+      const raw = inflateSync(bytes.subarray(entry.dataStart, entry.dataEnd));
+      let obj: GitObject;
       if (entry.typeCode === 6 || entry.typeCode === 7) {
         let base: GitObject | undefined;
         if (entry.typeCode === 6) {
-          const baseEntry = byOffset.get(entry.baseOffset ?? -1);
+          const baseEntry = byPosition.get(entry.baseOffset ?? -1);
           if (!baseEntry) throw new Error('ofs-delta base not in pack');
           base = resolveEntry(baseEntry);
         } else {
-          const baseEntry = entries.find((e) => {
-            const t = CODE_TYPE[e.typeCode];
-            if (!t || e.typeCode === 6 || e.typeCode === 7) return false;
-            return oidOf(t, inflateSync(pack.subarray(e.dataStart, e.dataEnd))) === entry.baseOid;
+          const baseEntry = entries.find((candidate) => {
+            const kind = CODE_TYPE[candidate.typeCode];
+            if (!kind || candidate.typeCode === 6 || candidate.typeCode === 7) return false;
+            return oidOf(kind, inflateSync(bytes.subarray(candidate.dataStart, candidate.dataEnd))) === entry.baseOid;
           });
           if (baseEntry) base = resolveEntry(baseEntry);
           else if (resolveBase) base = resolveBase(entry.baseOid ?? '');
           if (!base) throw new Error('ref-delta base not found');
         }
-        object = { type: base.type, data: applyDelta(base.data, raw) };
+        obj = { type: base.type, data: applyDelta(base.data, raw) };
       } else {
-        const type = CODE_TYPE[entry.typeCode];
-        if (!type) throw new Error(`unknown pack type ${entry.typeCode}`);
-        object = { type, data: raw };
+        const kind = CODE_TYPE[entry.typeCode];
+        if (!kind) throw new Error(`unknown pack type ${entry.typeCode}`);
+        obj = { type: kind, data: raw };
       }
-      byOffsetResolved.set(entry.offset, object);
-      resolved.set(oidOf(object.type, object.data), object);
-      return object;
+      resolvedByPosition.set(entry.offset, obj);
+      found.set(oidOf(obj.type, obj.data), obj);
+      return obj;
     } finally {
-      resolving.delete(entry.offset);
+      active.delete(entry.offset);
     }
   };
 
   for (const entry of entries) resolveEntry(entry);
-  return resolved;
+  return found;
 }
 
-/** Length of the zlib stream starting at `start`: exponential probe then binary search. */
-function skipZlib(pack: Buffer, start: number): number {
-  const limit = pack.length - 20;
+/** Length of the zlib stream starting at `from`: exponential probe then binary search. */
+function zlibStreamLength(bytes: Buffer, from: number): number {
+  const end = bytes.length - 20;
   // Failed inflations throw; V8 captures a stack per throw, which dominates the
   // probe cost. The probe is synchronous and restores the limit immediately.
-  const savedLimit = Error.stackTraceLimit;
+  const saved = Error.stackTraceLimit;
   Error.stackTraceLimit = 0;
   try {
-    const tryInflate = (end: number): boolean => {
+    const fits = (stop: number): boolean => {
       try {
-        inflateSync(pack.subarray(start, end));
+        inflateSync(bytes.subarray(from, stop));
         return true;
       } catch {
         return false;
       }
     };
-    let low = start + 1;
-    let high = Math.min(limit, start + 16);
-    if (!tryInflate(high)) {
+    let lo = from + 1;
+    let hi = Math.min(end, from + 16);
+    if (!fits(hi)) {
       // Exponential probe for an upper bound that inflates.
-      let probe = high;
-      while (probe < limit && !tryInflate(probe)) probe = Math.min(limit, probe * 2);
-      if (!tryInflate(probe)) throw new Error('unterminated zlib stream in pack');
-      low = Math.floor(probe / 2);
-      high = probe;
+      let guess = hi;
+      while (guess < end && !fits(guess)) guess = Math.min(end, guess * 2);
+      if (!fits(guess)) throw new Error('unterminated zlib stream in pack');
+      lo = Math.floor(guess / 2);
+      hi = guess;
     }
-    while (low < high) {
-      const mid = (low + high) >> 1;
-      if (tryInflate(mid)) high = mid;
-      else low = mid + 1;
+    while (lo < hi) {
+      const middle = (lo + hi) >> 1;
+      if (fits(middle)) hi = middle;
+      else lo = middle + 1;
     }
-    return low;
+    return lo;
   } finally {
-    Error.stackTraceLimit = savedLimit;
+    Error.stackTraceLimit = saved;
   }
 }
 
@@ -523,25 +587,25 @@ export class Forge {
   repos = new Map<string, Repo>();
   nextRepoId = 1;
   nextObjectId = 1;
-  private seqCounter = 0;
+  private sequence = 0;
 
-  private nextSeq(): number {
-    this.seqCounter += 1;
-    return this.seqCounter;
+  private takeSeq(): number {
+    this.sequence += 1;
+    return this.sequence;
   }
 
-  key(owner: string, name: string): string {
+  repoKey(owner: string, name: string): string {
     return `${owner}/${name}`;
   }
 
-  createRepo(owner: string, name: string, isPrivate: boolean, description: string): Repo | null {
-    if (this.repos.has(this.key(owner, name))) return null;
-    const repo: Repo = {
+  createRepo(owner: string, name: string, hidden: boolean, about: string): Repo | null {
+    if (this.repos.has(this.repoKey(owner, name))) return null;
+    const record: Repo = {
       id: this.nextRepoId++,
       owner,
       name,
-      private: isPrivate,
-      description,
+      private: hidden,
+      description: about,
       defaultBranch: 'main',
       refs: new Map(),
       refOrder: [],
@@ -551,321 +615,323 @@ export class Forge {
       labels: new Map(),
       nextNumber: 1,
       nextCommentId: 1,
-      seq: this.nextSeq(),
+      seq: this.takeSeq(),
     };
-    this.repos.set(this.key(owner, name), repo);
-    return repo;
+    this.repos.set(this.repoKey(owner, name), record);
+    return record;
   }
 
-  getRepo(owner: string, name: string): Repo | undefined {
-    return this.repos.get(this.key(owner, name));
+  getRepo(login: string, slug: string): Repo | undefined {
+    return this.repos.get(this.repoKey(login, slug));
   }
 
-  deleteRepo(owner: string, name: string): boolean {
-    return this.repos.delete(this.key(owner, name));
+  deleteRepo(login: string, slug: string): boolean {
+    return this.repos.delete(this.repoKey(login, slug));
   }
 
-  listRepos(owner: string): Repo[] {
-    const out: Repo[] = [];
-    for (const repo of this.repos.values()) if (repo.owner === owner) out.push(repo);
-    out.sort((a, b) => a.seq - b.seq);
-    return out;
+  listRepos(login: string): Repo[] {
+    const mine: Repo[] = [];
+    for (const record of this.repos.values()) {
+      if (record.owner === login) mine.push(record);
+    }
+    mine.sort((a, b) => a.seq - b.seq);
+    return mine;
   }
 
-  setRef(repo: Repo, ref: string, oid: string): void {
-    if (!repo.refs.has(ref)) repo.refOrder.push(ref);
-    repo.refs.set(ref, oid);
+  setRef(repository: Repo, name: string, target: string): void {
+    if (!repository.refs.has(name)) repository.refOrder.push(name);
+    repository.refs.set(name, target);
   }
 
-  deleteRef(repo: Repo, ref: string): void {
-    repo.refs.delete(ref);
-    repo.refOrder = repo.refOrder.filter((r) => r !== ref);
+  deleteRef(repository: Repo, name: string): void {
+    repository.refs.delete(name);
+    repository.refOrder = repository.refOrder.filter((r) => r !== name);
   }
 
-  defaultTip(repo: Repo): string | undefined {
-    return repo.refs.get(`refs/heads/${repo.defaultBranch}`);
+  defaultTip(repository: Repo): string | undefined {
+    return repository.refs.get(`refs/heads/${repository.defaultBranch}`);
   }
 
   // ---- graph helpers ----
 
-  commitOf(repo: Repo, oid: string): CommitInfo | undefined {
-    const object = repo.objects.get(oid);
-    if (!object || object.type !== 'commit') return undefined;
-    return parseCommit(object.data);
+  commitOf(repository: Repo, id: string): CommitInfo | undefined {
+    const obj = repository.objects.get(id);
+    if (!obj || obj.type !== 'commit') return undefined;
+    return parseCommit(obj.data);
   }
 
-  /** Commits reachable from `tips`, newest-first by BFS depth (parents after children). */
-  reachableCommits(repo: Repo, tips: readonly string[]): Map<string, number> {
-    const depth = new Map<string, number>();
-    const queue: Array<[string, number]> = [];
-    for (const tip of tips) {
-      if (isObjectId(tip) && !depth.has(tip)) {
-        depth.set(tip, 0);
-        queue.push([tip, 0]);
+  /** Commits reachable from `starts`, newest-first by BFS depth (parents after children). */
+  reachableCommits(repository: Repo, starts: readonly string[]): Map<string, number> {
+    const levels = new Map<string, number>();
+    const pending: Array<[string, number]> = [];
+    for (const root of starts) {
+      if (isObjectId(root) && !levels.has(root)) {
+        levels.set(root, 0);
+        pending.push([root, 0]);
       }
     }
-    for (let i = 0; i < queue.length; i += 1) {
-      const [oid, d] = queue[i]!;
-      const commit = this.commitOf(repo, oid);
-      if (!commit) continue;
-      for (const parent of commit.parents) {
-        if (!depth.has(parent)) {
-          depth.set(parent, d + 1);
-          queue.push([parent, d + 1]);
+    for (let i = 0; i < pending.length; i += 1) {
+      const [id, level] = pending[i]!;
+      const info = this.commitOf(repository, id);
+      if (!info) continue;
+      for (const prev of info.parents) {
+        if (!levels.has(prev)) {
+          levels.set(prev, level + 1);
+          pending.push([prev, level + 1]);
         }
       }
     }
-    return depth;
+    return levels;
   }
 
-  /** All objects (commits, trees, blobs) reachable from `tips`. */
-  reachableObjects(repo: Repo, tips: readonly string[]): Map<string, GitObject> {
-    const out = new Map<string, GitObject>();
-    const commits = this.reachableCommits(repo, tips);
-    const visitTree = (treeOid: string): void => {
-      const tree = repo.objects.get(treeOid);
-      if (!tree || tree.type !== 'tree' || out.has(treeOid)) return;
-      out.set(treeOid, tree);
-      for (const entry of parseTree(tree.data)) {
-        const child = repo.objects.get(entry.oid);
-        if (!child) continue;
-        if (child.type === 'tree') visitTree(entry.oid);
-        else if (!out.has(entry.oid)) out.set(entry.oid, child);
+  /** All objects (commits, trees, blobs) reachable from `starts`. */
+  reachableObjects(repository: Repo, starts: readonly string[]): Map<string, GitObject> {
+    const found = new Map<string, GitObject>();
+    const nodes = this.reachableCommits(repository, starts);
+    const walkTree = (root: string): void => {
+      const node = repository.objects.get(root);
+      if (!node || node.type !== 'tree' || found.has(root)) return;
+      found.set(root, node);
+      for (const item of parseTree(node.data)) {
+        const kid = repository.objects.get(item.oid);
+        if (!kid) continue;
+        if (kid.type === 'tree') walkTree(item.oid);
+        else if (!found.has(item.oid)) found.set(item.oid, kid);
       }
     };
-    for (const oid of commits.keys()) {
-      const object = repo.objects.get(oid);
-      if (!object) continue;
-      out.set(oid, object);
-      const commit = parseCommit(object.data);
-      visitTree(commit.tree);
+    for (const id of nodes.keys()) {
+      const obj = repository.objects.get(id);
+      if (!obj) continue;
+      found.set(id, obj);
+      const info = parseCommit(obj.data);
+      walkTree(info.tree);
     }
-    return out;
+    return found;
   }
 
-  isAncestor(repo: Repo, ancestor: string, descendant: string): boolean {
-    if (ancestor === descendant) return true;
+  isAncestor(repository: Repo, older: string, newer: string): boolean {
+    if (older === newer) return true;
     // Depth-first walk from the descendant with early exit: a fast-forward push
     // of one commit finds its parent in two steps, instead of a full BFS over
     // the whole history on every push.
-    const visited = new Set<string>();
-    const stack = [descendant];
-    while (stack.length > 0) {
-      const oid = stack.pop()!;
-      if (oid === ancestor) return true;
-      if (visited.has(oid)) continue;
-      visited.add(oid);
-      const commit = this.commitOf(repo, oid);
-      if (!commit) continue;
-      for (const parent of commit.parents) stack.push(parent);
+    const seen = new Set<string>();
+    const todo = [newer];
+    while (todo.length > 0) {
+      const id = todo.pop()!;
+      if (id === older) return true;
+      if (seen.has(id)) continue;
+      seen.add(id);
+      const info = this.commitOf(repository, id);
+      if (!info) continue;
+      for (const prev of info.parents) todo.push(prev);
     }
     return false;
   }
 
   /** The merge-base: the common ancestor at the greatest depth from the two tips. */
-  mergeBase(repo: Repo, a: string, b: string): string | undefined {
-    const fromA = this.reachableCommits(repo, [a]);
-    const fromB = this.reachableCommits(repo, [b]);
-    let best: string | undefined;
-    let bestDepth = -1;
-    for (const [oid, depthA] of fromA) {
-      const depthB = fromB.get(oid);
-      if (depthB === undefined) continue;
-      const depth = Math.min(depthA, depthB);
-      if (depth > bestDepth) {
-        bestDepth = depth;
-        best = oid;
+  mergeBase(repository: Repo, x: string, y: string): string | undefined {
+    const reachX = this.reachableCommits(repository, [x]);
+    const reachY = this.reachableCommits(repository, [y]);
+    let winner: string | undefined;
+    let winnerDepth = -1;
+    for (const [id, da] of reachX) {
+      const db = reachY.get(id);
+      if (db === undefined) continue;
+      const shallow = Math.min(da, db);
+      if (shallow > winnerDepth) {
+        winnerDepth = shallow;
+        winner = id;
       }
     }
-    return best;
+    return winner;
   }
 
   /** Flatten a commit's tree to path -> {oid, mode}. */
-  flattenTree(repo: Repo, treeOid: string): Map<string, { oid: string; mode: string }> {
-    const out = new Map<string, { oid: string; mode: string }>();
-    const walk = (oid: string, prefix: string): void => {
-      const tree = repo.objects.get(oid);
-      if (!tree || tree.type !== 'tree') return;
-      for (const entry of parseTree(tree.data)) {
-        const path = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
-        if (entry.mode === '40000') walk(entry.oid, path);
-        else out.set(path, { oid: entry.oid, mode: entry.mode });
+  flattenTree(repository: Repo, root: string): Map<string, { oid: string; mode: string }> {
+    const flat = new Map<string, { oid: string; mode: string }>();
+    const descend = (id: string, dir: string): void => {
+      const node = repository.objects.get(id);
+      if (!node || node.type !== 'tree') return;
+      for (const item of parseTree(node.data)) {
+        const full = dir === '' ? item.name : `${dir}/${item.name}`;
+        if (item.mode === '40000') descend(item.oid, full);
+        else flat.set(full, { oid: item.oid, mode: item.mode });
       }
     };
-    walk(treeOid, '');
-    return out;
+    descend(root, '');
+    return flat;
   }
 
   /** Build (and store) a tree from a flat path map; returns the root tree oid. */
-  buildTreeFromMap(repo: Repo, files: Map<string, { oid: string; mode: string }>): string {
-    interface Node {
+  buildTreeFromMap(repository: Repo, entries: Map<string, { oid: string; mode: string }>): string {
+    interface Dir {
       files: Map<string, { oid: string; mode: string }>;
-      dirs: Map<string, Node>;
+      dirs: Map<string, Dir>;
     }
-    const root: Node = { files: new Map(), dirs: new Map() };
-    for (const [path, value] of files) {
-      const parts = path.split('/');
-      let node = root;
-      for (let i = 0; i < parts.length - 1; i += 1) {
-        const part = parts[i]!;
-        let child = node.dirs.get(part);
-        if (!child) {
-          child = { files: new Map(), dirs: new Map() };
-          node.dirs.set(part, child);
+    const top: Dir = { files: new Map(), dirs: new Map() };
+    for (const [path, value] of entries) {
+      const segments = path.split('/');
+      let cursor = top;
+      for (let i = 0; i < segments.length - 1; i += 1) {
+        const seg = segments[i]!;
+        let next = cursor.dirs.get(seg);
+        if (!next) {
+          next = { files: new Map(), dirs: new Map() };
+          cursor.dirs.set(seg, next);
         }
-        node = child;
+        cursor = next;
       }
-      node.files.set(parts[parts.length - 1]!, value);
+      cursor.files.set(segments[segments.length - 1]!, value);
     }
-    const build = (node: Node): string => {
-      const entries: TreeEntry[] = [];
-      for (const [name, value] of node.files) entries.push({ mode: value.mode, name, oid: value.oid });
-      for (const [name, child] of node.dirs) entries.push({ mode: '40000', name, oid: build(child) });
-      const { oid, object } = makeTree(entries);
-      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
+    const assemble = (node: Dir): string => {
+      const rows: TreeEntry[] = [];
+      for (const [key, file] of node.files) rows.push({ mode: file.mode, name: key, oid: file.oid });
+      for (const [key, child] of node.dirs) rows.push({ mode: '40000', name: key, oid: assemble(child) });
+      const { oid, object } = makeTree(rows);
+      if (!repository.objects.has(oid)) repository.objects.set(oid, object);
       return oid;
     };
-    return build(root);
+    return assemble(top);
   }
 
   /** Line-diff counts by multiset difference (small files; additions >= 1 for real changes). */
-  static lineDiff(oldText: string, newText: string): { additions: number; deletions: number } {
-    const countLines = (text: string): Map<string, number> => {
-      const map = new Map<string, number>();
-      if (text === '') return map;
-      for (const line of text.split('\n')) map.set(line, (map.get(line) ?? 0) + 1);
-      return map;
+  static lineDiff(before: string, after: string): { additions: number; deletions: number } {
+    const tally = (src: string): Map<string, number> => {
+      const counts = new Map<string, number>();
+      if (src === '') return counts;
+      for (const row of src.split('\n')) counts.set(row, (counts.get(row) ?? 0) + 1);
+      return counts;
     };
-    const oldLines = countLines(oldText);
-    const newLines = countLines(newText);
-    let additions = 0;
-    let deletions = 0;
-    for (const [line, count] of newLines) additions += Math.max(0, count - (oldLines.get(line) ?? 0));
-    for (const [line, count] of oldLines) deletions += Math.max(0, count - (newLines.get(line) ?? 0));
-    return { additions, deletions };
+    const beforeCounts = tally(before);
+    const afterCounts = tally(after);
+    let added = 0;
+    let removed = 0;
+    for (const [row, n] of afterCounts) added += Math.max(0, n - (beforeCounts.get(row) ?? 0));
+    for (const [row, n] of beforeCounts) removed += Math.max(0, n - (afterCounts.get(row) ?? 0));
+    return { additions: added, deletions: removed };
   }
 
   /** Diff two trees (by oid) into per-file changes. */
-  diffTrees(repo: Repo, baseTreeOid: string | undefined, headTreeOid: string | undefined): FileChange[] {
-    const base = baseTreeOid ? this.flattenTree(repo, baseTreeOid) : new Map<string, { oid: string; mode: string }>();
-    const head = headTreeOid ? this.flattenTree(repo, headTreeOid) : new Map<string, { oid: string; mode: string }>();
-    const changes: FileChange[] = [];
-    const paths = new Set<string>([...base.keys(), ...head.keys()]);
-    for (const path of [...paths].sort()) {
-      const b = base.get(path);
-      const h = head.get(path);
-      if (b && !h) {
-        const oldText = repo.objects.get(b.oid)?.data.toString('utf8') ?? '';
-        const { deletions } = Forge.lineDiff(oldText, '');
-        changes.push({ filename: path, status: 'removed', additions: 0, deletions, changes: deletions });
-      } else if (!b && h) {
-        const newText = repo.objects.get(h.oid)?.data.toString('utf8') ?? '';
-        const { additions } = Forge.lineDiff('', newText);
-        changes.push({ filename: path, status: 'added', additions, deletions: 0, changes: additions });
-      } else if (b && h && b.oid !== h.oid) {
-        const oldText = repo.objects.get(b.oid)?.data.toString('utf8') ?? '';
-        const newText = repo.objects.get(h.oid)?.data.toString('utf8') ?? '';
-        const { additions, deletions } = Forge.lineDiff(oldText, newText);
-        changes.push({ filename: path, status: 'modified', additions, deletions, changes: additions + deletions });
+  diffTrees(repository: Repo, baseRoot: string | undefined, headRoot: string | undefined): FileChange[] {
+    const before = baseRoot ? this.flattenTree(repository, baseRoot) : new Map<string, { oid: string; mode: string }>();
+    const after = headRoot ? this.flattenTree(repository, headRoot) : new Map<string, { oid: string; mode: string }>();
+    const list: FileChange[] = [];
+    const allPaths = new Set<string>([...before.keys(), ...after.keys()]);
+    for (const path of [...allPaths].sort()) {
+      const was = before.get(path);
+      const is = after.get(path);
+      if (was && !is) {
+        const oldBody = repository.objects.get(was.oid)?.data.toString('utf8') ?? '';
+        const { deletions: removed } = Forge.lineDiff(oldBody, '');
+        list.push({ filename: path, status: 'removed', additions: 0, deletions: removed, changes: removed });
+      } else if (!was && is) {
+        const newBody = repository.objects.get(is.oid)?.data.toString('utf8') ?? '';
+        const { additions: added } = Forge.lineDiff('', newBody);
+        list.push({ filename: path, status: 'added', additions: added, deletions: 0, changes: added });
+      } else if (was && is && was.oid !== is.oid) {
+        const oldBody = repository.objects.get(was.oid)?.data.toString('utf8') ?? '';
+        const newBody = repository.objects.get(is.oid)?.data.toString('utf8') ?? '';
+        const { additions: added, deletions: removed } = Forge.lineDiff(oldBody, newBody);
+        list.push({ filename: path, status: 'modified', additions: added, deletions: removed, changes: added + removed });
       }
     }
-    return changes;
+    return list;
   }
 
   // ---- contents API core ----
 
-  /** Commit a file write/delete on `branch`. Returns the new commit + blob oid. */
+  /** Commit a file write/delete on `branchName`. Returns the new commit + blob oid. */
   commitFile(
-    repo: Repo,
-    branch: string,
-    path: string,
-    content: Buffer | null,
-    message: string,
-    expectedSha?: string,
+    repository: Repo,
+    branchName: string,
+    filePath: string,
+    payload: Buffer | null,
+    note: string,
+    wantSha?: string,
   ): { commitOid: string; blobOid: string | null; status: 'created' | 'updated' } {
-    const ref = `refs/heads/${branch}`;
-    const tip = repo.refs.get(ref);
-    const isUpdate = tip !== undefined && this.fileAt(repo, tip, path) !== undefined;
-    if (tip !== undefined) {
-      const current = this.fileAt(repo, tip, path);
-      if (expectedSha !== undefined) {
-        if (current?.oid !== expectedSha) {
-          const err = new Error('stale sha') as Error & { code?: string };
-          err.code = 'STALE_SHA';
-          throw err;
+    const refName = `refs/heads/${branchName}`;
+    const head = repository.refs.get(refName);
+    const exists = head !== undefined && this.fileAt(repository, head, filePath) !== undefined;
+    if (head !== undefined) {
+      const present = this.fileAt(repository, head, filePath);
+      if (wantSha !== undefined) {
+        if (present?.oid !== wantSha) {
+          const problem = new Error('stale sha') as Error & { code?: string };
+          problem.code = 'STALE_SHA';
+          throw problem;
         }
       }
-    } else if (expectedSha !== undefined) {
-      const err = new Error('stale sha') as Error & { code?: string };
-      err.code = 'STALE_SHA';
-      throw err;
+    } else if (wantSha !== undefined) {
+      const problem = new Error('stale sha') as Error & { code?: string };
+      problem.code = 'STALE_SHA';
+      throw problem;
     }
-    let files = new Map<string, { oid: string; mode: string }>();
-    if (tip !== undefined) {
-      const commit = this.commitOf(repo, tip);
-      if (commit) files = this.flattenTree(repo, commit.tree);
+    let tree = new Map<string, { oid: string; mode: string }>();
+    if (head !== undefined) {
+      const headInfo = this.commitOf(repository, head);
+      if (headInfo) tree = this.flattenTree(repository, headInfo.tree);
     }
-    let blobOid: string | null = null;
-    if (content === null) {
-      files.delete(path);
+    let blob: string | null = null;
+    if (payload === null) {
+      tree.delete(filePath);
     } else {
-      const { oid, object } = makeBlob(content);
-      if (!repo.objects.has(oid)) repo.objects.set(oid, object);
-      blobOid = oid;
-      files.set(path, { oid, mode: '100644' });
+      const { oid, object } = makeBlob(payload);
+      if (!repository.objects.has(oid)) repository.objects.set(oid, object);
+      blob = oid;
+      tree.set(filePath, { oid, mode: '100644' });
     }
-    const treeOid = this.buildTreeFromMap(repo, files);
-    const { oid: commitOid, object } = makeCommit({
-      tree: treeOid,
-      parents: tip !== undefined ? [tip] : [],
+    const root = this.buildTreeFromMap(repository, tree);
+    const { oid: commit, object } = makeCommit({
+      tree: root,
+      parents: head !== undefined ? [head] : [],
       author: '',
       committer: '',
-      message,
+      message: note,
     });
-    if (!repo.objects.has(commitOid)) repo.objects.set(commitOid, object);
-    this.setRef(repo, ref, commitOid);
-    return { commitOid, blobOid, status: isUpdate ? 'updated' : 'created' };
+    if (!repository.objects.has(commit)) repository.objects.set(commit, object);
+    this.setRef(repository, refName, commit);
+    return { commitOid: commit, blobOid: blob, status: exists ? 'updated' : 'created' };
   }
 
-  fileAt(repo: Repo, commitOid: string, path: string): { oid: string; mode: string } | undefined {
-    const commit = this.commitOf(repo, commitOid);
-    if (!commit) return undefined;
-    return this.flattenTree(repo, commit.tree).get(path);
+  fileAt(repository: Repo, commit: string, filePath: string): { oid: string; mode: string } | undefined {
+    const info = this.commitOf(repository, commit);
+    if (!info) return undefined;
+    return this.flattenTree(repository, info.tree).get(filePath);
   }
 
   /** Resolve a ref-ish (branch name, full ref, or commit oid) to a commit oid. */
-  resolveRefish(repo: Repo, refish: string | undefined): string | undefined {
-    if (refish === undefined || refish === '') return this.defaultTip(repo);
-    if (isObjectId(refish)) return repo.objects.has(refish) ? refish : undefined;
-    if (refish.startsWith('refs/')) return repo.refs.get(refish);
-    return repo.refs.get(`refs/heads/${refish}`);
+  resolveRefish(repository: Repo, want: string | undefined): string | undefined {
+    if (want === undefined || want === '') return this.defaultTip(repository);
+    if (isObjectId(want)) return repository.objects.has(want) ? want : undefined;
+    if (want.startsWith('refs/')) return repository.refs.get(want);
+    return repository.refs.get(`refs/heads/${want}`);
   }
 
   // ---- issues / pulls ----
 
-  createIssue(repo: Repo, title: string, body: string, labels: string[]): Issue {
-    const number = repo.nextNumber++;
-    const issue: Issue = {
+  createIssue(repository: Repo, heading: string, text: string, tags: string[]): Issue {
+    const num = repository.nextNumber++;
+    const record: Issue = {
       id: this.nextObjectId++,
-      number,
-      title,
-      body,
+      number: num,
+      title: heading,
+      body: text,
       state: 'open',
-      labels: [...labels],
+      labels: [...tags],
       comments: [],
-      seq: this.nextSeq(),
+      seq: this.takeSeq(),
     };
-    repo.issues.set(number, issue);
-    return issue;
+    repository.issues.set(num, record);
+    return record;
   }
 
-  createPull(repo: Repo, title: string, body: string, headRef: string, baseRef: string, headSha: string, baseSha: string): Pull {
-    const number = repo.nextNumber++;
-    const pull: Pull = {
+  createPull(repository: Repo, heading: string, text: string, headRef: string, baseRef: string, headSha: string, baseSha: string): Pull {
+    const num = repository.nextNumber++;
+    const record: Pull = {
       id: this.nextObjectId++,
-      number,
-      title,
-      body,
+      number: num,
+      title: heading,
+      body: text,
       state: 'open',
       merged: false,
       mergedAt: null,
@@ -874,84 +940,84 @@ export class Forge {
       baseRef,
       headSha,
       baseSha,
-      seq: this.nextSeq(),
+      seq: this.takeSeq(),
     };
-    repo.pulls.set(number, pull);
-    return pull;
+    repository.pulls.set(num, record);
+    return record;
   }
 
-  /** Three-way merge of `headTip` onto `baseTip`; returns the merge commit or a conflict. */
-  mergePullRequest(repo: Repo, pull: Pull, method: 'squash' | 'merge' | 'rebase'): { commitOid: string } | { conflict: string[] } {
-    const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-    const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-    if (headTip === undefined || baseTip === undefined) return { conflict: ['missing ref'] };
-    const baseCommitOid = this.mergeBase(repo, headTip, baseTip) ?? pull.baseSha;
-    const baseCommit = this.commitOf(repo, baseCommitOid);
-    const headCommit = this.commitOf(repo, headTip);
-    const defaultCommit = this.commitOf(repo, baseTip);
-    if (!baseCommit || !headCommit || !defaultCommit) return { conflict: ['missing commit'] };
-    const baseFiles = this.flattenTree(repo, baseCommit.tree);
-    const headFiles = this.flattenTree(repo, headCommit.tree);
-    const defaultFiles = this.flattenTree(repo, defaultCommit.tree);
-    const merged = new Map<string, { oid: string; mode: string }>(defaultFiles);
+  /** Three-way merge of `head` onto `base`; returns the merge commit or a conflict. */
+  mergePullRequest(repository: Repo, request: Pull, mode: 'squash' | 'merge' | 'rebase'): { commitOid: string } | { conflict: string[] } {
+    const head = repository.refs.get(`refs/heads/${request.headRef}`);
+    const base = repository.refs.get(`refs/heads/${request.baseRef}`);
+    if (head === undefined || base === undefined) return { conflict: ['missing ref'] };
+    const mergeRoot = this.mergeBase(repository, head, base) ?? request.baseSha;
+    const baseInfo = this.commitOf(repository, mergeRoot);
+    const headInfo = this.commitOf(repository, head);
+    const baseHead = this.commitOf(repository, base);
+    if (!baseInfo || !headInfo || !baseHead) return { conflict: ['missing commit'] };
+    const baseFiles = this.flattenTree(repository, baseInfo.tree);
+    const headFiles = this.flattenTree(repository, headInfo.tree);
+    const defaultFiles = this.flattenTree(repository, baseHead.tree);
+    const result = new Map<string, { oid: string; mode: string }>(defaultFiles);
     const conflicts: string[] = [];
-    const paths = new Set<string>([...baseFiles.keys(), ...headFiles.keys(), ...defaultFiles.keys()]);
-    for (const path of paths) {
-      const b = baseFiles.get(path);
-      const h = headFiles.get(path);
-      const d = defaultFiles.get(path);
-      const same = (x?: { oid: string }, y?: { oid: string }): boolean => (x?.oid ?? null) === (y?.oid ?? null);
-      if (same(h, d)) continue; // no change, or the same change on both sides
-      if (same(h, b)) continue; // only the default side changed; keep default
-      if (same(d, b)) {
+    const allPaths = new Set<string>([...baseFiles.keys(), ...headFiles.keys(), ...defaultFiles.keys()]);
+    const equal = (x?: { oid: string }, y?: { oid: string }): boolean => (x?.oid ?? null) === (y?.oid ?? null);
+    for (const path of allPaths) {
+      const ancestor = baseFiles.get(path);
+      const onHead = headFiles.get(path);
+      const onDefault = defaultFiles.get(path);
+      if (equal(onHead, onDefault)) continue; // no change, or the same change on both sides
+      if (equal(onHead, ancestor)) continue; // only the default side changed; keep default
+      if (equal(onDefault, ancestor)) {
         // only the head side changed; take it
-        if (h) merged.set(path, h);
-        else merged.delete(path);
+        if (onHead) result.set(path, onHead);
+        else result.delete(path);
         continue;
       }
       conflicts.push(path);
     }
     if (conflicts.length > 0) return { conflict: conflicts };
-    const treeOid = this.buildTreeFromMap(repo, merged);
-    const parents = method === 'merge' ? [baseTip, headTip] : [baseTip];
-    const { oid: commitOid, object } = makeCommit({
-      tree: treeOid,
-      parents,
+    const root = this.buildTreeFromMap(repository, result);
+    const links = mode === 'merge' ? [base, head] : [base];
+    const { oid: commit, object } = makeCommit({
+      tree: root,
+      parents: links,
       author: '',
       committer: '',
-      message: `Merge pull request #${pull.number} from ${pull.headRef}`,
+      message: `Merge pull request #${request.number} from ${request.headRef}`,
     });
-    if (!repo.objects.has(commitOid)) repo.objects.set(commitOid, object);
-    this.setRef(repo, `refs/heads/${pull.baseRef}`, commitOid);
-    pull.state = 'closed';
-    pull.merged = true;
-    pull.mergedAt = FIXED_ISO_TIME;
-    pull.mergeCommitSha = commitOid;
-    pull.baseSha = commitOid;
-    return { commitOid };
+    if (!repository.objects.has(commit)) repository.objects.set(commit, object);
+    this.setRef(repository, `refs/heads/${request.baseRef}`, commit);
+    request.state = 'closed';
+    request.merged = true;
+    request.mergedAt = FIXED_ISO_TIME;
+    request.mergeCommitSha = commit;
+    request.baseSha = commit;
+    return { commitOid: commit };
   }
 
   /** MERGEABLE / CONFLICTING for an open pull request (UNKNOWN when refs are missing). */
-  mergeable(repo: Repo, pull: Pull): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
-    if (pull.state !== 'open') return 'UNKNOWN';
-    const headTip = repo.refs.get(`refs/heads/${pull.headRef}`);
-    const baseTip = repo.refs.get(`refs/heads/${pull.baseRef}`);
-    if (headTip === undefined || baseTip === undefined) return 'UNKNOWN';
-    const baseCommitOid = this.mergeBase(repo, headTip, baseTip) ?? pull.baseSha;
-    const baseCommit = this.commitOf(repo, baseCommitOid);
-    const headCommit = this.commitOf(repo, headTip);
-    const defaultCommit = this.commitOf(repo, baseTip);
-    if (!baseCommit || !headCommit || !defaultCommit) return 'UNKNOWN';
-    const baseFiles = this.flattenTree(repo, baseCommit.tree);
-    const headFiles = this.flattenTree(repo, headCommit.tree);
-    const defaultFiles = this.flattenTree(repo, defaultCommit.tree);
-    const same = (x?: { oid: string }, y?: { oid: string }): boolean => (x?.oid ?? null) === (y?.oid ?? null);
-    const paths = new Set<string>([...baseFiles.keys(), ...headFiles.keys(), ...defaultFiles.keys()]);
-    for (const path of paths) {
-      const b = baseFiles.get(path);
-      const h = headFiles.get(path);
-      const d = defaultFiles.get(path);
-      if (same(h, d) || same(h, b) || same(d, b)) continue;
+  mergeable(repository: Repo, request: Pull): 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN' {
+    if (request.state !== 'open') return 'UNKNOWN';
+    const head = repository.refs.get(`refs/heads/${request.headRef}`);
+    const base = repository.refs.get(`refs/heads/${request.baseRef}`);
+    if (head === undefined || base === undefined) return 'UNKNOWN';
+    const mergeRoot = this.mergeBase(repository, head, base) ?? request.baseSha;
+    const baseInfo = this.commitOf(repository, mergeRoot);
+    const headInfo = this.commitOf(repository, head);
+    const baseHead = this.commitOf(repository, base);
+    if (!baseInfo || !headInfo || !baseHead) return 'UNKNOWN';
+    const baseFiles = this.flattenTree(repository, baseInfo.tree);
+    const headFiles = this.flattenTree(repository, headInfo.tree);
+    const defaultFiles = this.flattenTree(repository, baseHead.tree);
+    const equal = (x?: { oid: string }, y?: { oid: string }): boolean => (x?.oid ?? null) === (y?.oid ?? null);
+    const allPaths = new Set<string>([...baseFiles.keys(), ...headFiles.keys(), ...defaultFiles.keys()]);
+    for (const path of allPaths) {
+      const ancestor = baseFiles.get(path);
+      const onHead = headFiles.get(path);
+      const onDefault = defaultFiles.get(path);
+      if (equal(onHead, onDefault) || equal(onHead, ancestor) || equal(onDefault, ancestor)) continue;
       return 'CONFLICTING';
     }
     return 'MERGEABLE';
