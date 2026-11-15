@@ -1,250 +1,330 @@
-// app.ts — the HTTP server: routing, bearer <redacted> and the JSON envelope.
-// main.ts (the kit's lifecycle) is the entry point; this file is the server itself,
-// serving git smart HTTP, REST v3, GraphQL v4 and MCP from one process.
+// app.ts — the HTTP server: one Node process, four surfaces.
 //
-// Performance design (v2 rewrite): the timed workloads are HTTP-heavy — 200
-// pushes, 2,000 sequential reads on one keep-alive connection — so the hot
-// paths skip work the v1 router did per request:
-//  * the git-route regex is only tested when the path contains '.git/';
-//  * query parsing is skipped entirely when the URL has no '?';
-//  * request bodies use a single-chunk fast path (no Buffer.concat when the
-//    whole body arrived in one data event, which is the common case for small
-//    JSON and pack bodies on localhost);
-//  * pre-built Buffers from the handlers (cached issue JSON, cached fetch
-//    answers) are written directly, never re-stringified.
-// Behavior (routes, status codes, headers, envelopes) is unchanged.
+// Routing, in order:
+//   GET  /healthz                                  the env's boot probe, no auth
+//   GET  /api/v3[/]                                the API root, no auth
+//   GET  /api/v3/meta                             the meta probe, no auth
+//   *    /api/v3/...                              REST v3, Bearer token required
+//   POST /api/graphql                             GraphQL, Bearer token required
+//   POST /mcp                                     MCP (auth is enforced inside, on tools/call)
+//   *    /{owner}/{repo}.git/info/refs            smart-HTTP advertisements, Bearer required
+//   POST /{owner}/{repo}.git/git-upload-pack      fetch / ls-refs, Bearer required
+//   POST /{owner}/{repo}.git/git-receive-pack     push, Bearer required
+//
+// Auth is the entry's only credential: any non-empty `Authorization: Bearer <token>`
+// names the viewer; a missing header is a 401. The server never learns the token
+// value, because the entry lifecycle (main.ts) never passes it one. Every reply
+// carries a non-empty X-GitHub-Request-Id, and every REST reply is JSON.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
-import { Forge } from './store.ts';
-import { handleRest, type ApiResponse } from './rest.ts';
-import { handleGraphQL } from './graphql.ts';
-import { handleMcp } from './mcp.ts';
-import { handleInfoRefs, handleUploadPack, handleReceivePack, type GitResponse } from './gitproto.ts';
+import { ForgeStore, VIEWER } from './store.ts';
+import { routeRest, type RestReply } from './rest.ts';
+import { routeGraphQL } from './graphql.ts';
+import { routeMcp } from './mcp.ts';
+import { handleReceivePack, handleUploadPack, v0Advertisement, v2Advertisement } from './gitproto.ts';
 
-const JSON_CONTENT_TYPE = 'application/json; charset=utf-8';
-const MAX_BODY_SIZE = 64 * 1024 * 1024;
+const JSON_TYPE = 'application/json; charset=utf-8';
+/** The largest request body the server accepts: packs are the big ones. */
+const MAX_BODY_BYTES = 256 * 1024 * 1024;
 
-let requestSeq = 0;
+let requestCounter = 0;
 
 function nextRequestId(): string {
-  requestSeq += 1;
-  return `req-${requestSeq}`;
+  requestCounter += 1;
+  return `req-${requestCounter.toString(16).padStart(8, '0')}`;
 }
 
-function decodePart(segment: string): string {
+function send(
+  res: ServerResponse,
+  status: number,
+  body: string | Buffer | null,
+  contentType: string,
+  extra: Record<string, string> = {},
+): void {
+  const headers: Record<string, string> = {
+    'content-type': contentType,
+    'x-github-request-id': nextRequestId(),
+    ...extra,
+  };
+  if (body === null) {
+    res.writeHead(status, headers);
+    res.end();
+    return;
+  }
+  const bytes = typeof body === 'string' ? Buffer.from(body, 'utf8') : body;
+  headers['content-length'] = String(bytes.length);
+  res.writeHead(status, headers);
+  res.end(bytes);
+}
+
+function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
+  send(res, status, JSON.stringify(body), JSON_TYPE, extra);
+}
+
+function notFound(res: ServerResponse): void {
+  sendJson(res, 404, { message: 'Not Found' });
+}
+
+function unauthorized(res: ServerResponse): void {
+  sendJson(res, 401, { message: 'Requires authentication' });
+}
+
+/** The bearer token, or null when the request carries none. */
+function bearerToken(req: IncomingMessage): string | null {
+  const header = req.headers.authorization;
+  if (typeof header !== 'string') return null;
+  const match = /^Bearer\s+(\S+)\s*$/i.exec(header);
+  return match === null ? null : match[1];
+}
+
+/** Read the whole request body, or reject when it passes the cap. */
+function readBody(req: IncomingMessage): Promise<Buffer> {
+  return new Promise<Buffer>((resolve, reject) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let failed = false;
+    req.on('data', (chunk: Buffer) => {
+      if (failed) return;
+      size += chunk.length;
+      if (size > MAX_BODY_BYTES) {
+        failed = true;
+        reject(new Error('request body too large'));
+        req.destroy();
+        return;
+      }
+      chunks.push(chunk);
+    });
+    req.on('end', () => {
+      if (!failed) resolve(Buffer.concat(chunks));
+    });
+    req.on('error', (error) => {
+      if (!failed) {
+        failed = true;
+        reject(error);
+      }
+    });
+  });
+}
+
+function decodeSegment(segment: string): string | null {
   try {
     return decodeURIComponent(segment);
   } catch {
-    return segment;
+    return null;
   }
 }
 
-/** Read the request body. Single-chunk fast path: most local bodies arrive whole. */
-function readRequestBody(request: IncomingMessage): Promise<Buffer> {
-  return new Promise((resolve, reject) => {
-    let first: Buffer | null = null;
-    const parts: Buffer[] = [];
-    let received = 0;
-    request.on('data', (piece: Buffer) => {
-      received += piece.length;
-      if (received > MAX_BODY_SIZE) {
-        reject(new Error('request body too large'));
-        return;
-      }
-      if (first === null) first = piece;
-      else parts.push(piece);
-    });
-    request.on('end', () => {
-      if (parts.length === 0) resolve(first ?? Buffer.alloc(0));
-      else resolve(Buffer.concat(first === null ? parts : [first, ...parts]));
-    });
-    request.on('error', reject);
-  });
+/** Split a pathname into decoded segments; null when any segment is undecodable. */
+function pathSegments(pathname: string): string[] | null {
+  const raw = pathname.split('/').filter((part) => part !== '');
+  const out: string[] = [];
+  for (const part of raw) {
+    const decoded = decodeSegment(part);
+    if (decoded === null) return null;
+    out.push(decoded);
+  }
+  return out;
 }
 
-function writeBuffer(response: ServerResponse, code: number, mime: string, payload: Buffer, more: Record<string, string> = {}): void {
-  response.writeHead(code, { 'content-type': mime, 'content-length': payload.length, 'x-github-request-id': nextRequestId(), ...more });
-  response.end(payload);
+/** Parse a request body as JSON; `undefined` for an empty body, `null` for malformed JSON. */
+function parseJsonBody(raw: Buffer): unknown {
+  if (raw.length === 0) return undefined;
+  try {
+    return JSON.parse(raw.toString('utf8'));
+  } catch {
+    return null;
+  }
 }
 
-function writeJson(response: ServerResponse, code: number, payload: unknown, more: Record<string, string> = {}): void {
-  const encoded = `${JSON.stringify(payload)}\n`;
-  writeBuffer(response, code, JSON_CONTENT_TYPE, Buffer.from(encoded, 'utf8'), more);
+/** The git smart-HTTP routes: /{owner}/{repo}.git/<endpoint>. */
+async function handleGit(
+  store: ForgeStore,
+  req: IncomingMessage,
+  res: ServerResponse,
+  owner: string,
+  repoName: string,
+  endpoint: string,
+  query: URLSearchParams,
+): Promise<void> {
+  if (owner !== VIEWER.login) {
+    notFound(res);
+    return;
+  }
+  const repo = store.getRepo(owner, repoName);
+  if (repo === undefined) {
+    notFound(res);
+    return;
+  }
+
+  if (endpoint === 'info/refs') {
+    const service = query.get('service');
+    const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+    if (service === 'git-receive-pack') {
+      send(res, 200, v0Advertisement(store, repo, 'git-receive-pack'), 'application/x-git-receive-pack-advertisement');
+      return;
+    }
+    if (v2 && service !== 'git-receive-pack') {
+      send(res, 200, v2Advertisement(), 'application/x-git-upload-pack-advertisement');
+      return;
+    }
+    if (service === 'git-upload-pack' || service === null) {
+      send(res, 200, v0Advertisement(store, repo, 'git-upload-pack'), 'application/x-git-upload-pack-advertisement');
+      return;
+    }
+    notFound(res);
+    return;
+  }
+
+  if (req.method !== 'POST') {
+    notFound(res);
+    return;
+  }
+  const body = await readBody(req);
+  if (endpoint === 'git-upload-pack') {
+    const v2 = (req.headers['git-protocol'] ?? '') === 'version=2';
+    const result = handleUploadPack(store, repo, body, v2);
+    send(res, result.status, result.body, result.contentType);
+    return;
+  }
+  if (endpoint === 'git-receive-pack') {
+    const result = handleReceivePack(store, repo, body);
+    send(res, result.status, result.body, result.contentType);
+    return;
+  }
+  notFound(res);
 }
 
-function writeEmpty(response: ServerResponse): void {
-  response.writeHead(204, { 'x-github-request-id': nextRequestId() });
-  response.end();
-}
-
-function readBearer(request: IncomingMessage): string {
-  const value = request.headers.authorization;
-  if (!value || !value.startsWith('Bearer ')) return '';
-  return value.slice('Bearer '.length).trim();
-}
-
-/** Build the server. It listens on nothing until the caller binds it. */
+/** Build the server. It binds nothing until the caller listens. */
 export function createApp(): Server {
-  const store = new Forge();
-  return createServer((request: IncomingMessage, response: ServerResponse) => {
+  const store = new ForgeStore();
+  return createServer((req: IncomingMessage, res: ServerResponse) => {
     void (async () => {
       try {
-        await routeRequest(store, request, response);
-      } catch (error) {
+        const method = req.method ?? 'GET';
+        let url: URL;
         try {
-          process.stderr.write(`[app] handler error: ${error instanceof Error ? error.message : String(error)}\n`);
+          url = new URL(req.url ?? '/', 'http://entry');
         } catch {
-          // ignore logging failures
+          notFound(res);
+          return;
         }
-        if (!response.headersSent) writeJson(response, 500, { message: 'Internal Server Error' });
-        else response.end();
+        const pathname = url.pathname;
+        const query = url.searchParams;
+
+        // The boot probe.
+        if (method === 'GET' && pathname === '/healthz') {
+          sendJson(res, 200, { ok: true });
+          return;
+        }
+
+        // The git smart-HTTP routes.
+        const gitMatch = /^\/([^/]+)\/([^/]+)\.git\/(info\/refs|git-upload-pack|git-receive-pack)$/.exec(pathname);
+        if (gitMatch !== null) {
+          if (bearerToken(req) === null) {
+            unauthorized(res);
+            return;
+          }
+          const owner = decodeSegment(gitMatch[1]);
+          const repoName = decodeSegment(gitMatch[2]);
+          if (owner === null || repoName === null) {
+            notFound(res);
+            return;
+          }
+          await handleGit(store, req, res, owner, repoName, gitMatch[3], query);
+          return;
+        }
+
+        // The MCP endpoint: it reads its own raw body and enforces auth on tools/call.
+        if (pathname === '/mcp') {
+          if (method !== 'POST') {
+            notFound(res);
+            return;
+          }
+          const raw = await readBody(req);
+          const reply = routeMcp(store, raw.toString('utf8'), bearerToken(req) !== null);
+          send(res, reply.status, reply.body, JSON_TYPE);
+          return;
+        }
+
+        // GraphQL.
+        if (pathname === '/api/graphql') {
+          if (method !== 'POST') {
+            notFound(res);
+            return;
+          }
+          if (bearerToken(req) === null) {
+            unauthorized(res);
+            return;
+          }
+          const raw = await readBody(req);
+          const body = parseJsonBody(raw);
+          if (body === null) {
+            sendJson(res, 400, { message: 'malformed JSON body' });
+            return;
+          }
+          const result = routeGraphQL(store, body);
+          send(res, result.status, result.text, JSON_TYPE);
+          return;
+        }
+
+        // The REST surface.
+        if (pathname === '/api/v3' || pathname === '/api/v3/') {
+          if (method !== 'GET') {
+            notFound(res);
+            return;
+          }
+          sendJson(res, 200, { current_user_url: '/api/v3/user', rate_limit_url: '/api/v3/rate_limit' }, { 'x-oauth-scopes': 'repo, read:org' });
+          return;
+        }
+        if (pathname === '/api/v3/meta') {
+          if (method !== 'GET') {
+            notFound(res);
+            return;
+          }
+          sendJson(res, 200, { installed_version: '1.0.0' });
+          return;
+        }
+        if (pathname.startsWith('/api/v3/')) {
+          if (bearerToken(req) === null) {
+            unauthorized(res);
+            return;
+          }
+          const segments = pathSegments(pathname.slice('/api/v3/'.length));
+          if (segments === null) {
+            notFound(res);
+            return;
+          }
+          const needsBody = method === 'POST' || method === 'PUT' || method === 'PATCH' || method === 'DELETE';
+          let body: unknown;
+          if (needsBody) {
+            const raw = await readBody(req);
+            body = parseJsonBody(raw);
+            if (body === null) {
+              sendJson(res, 400, { message: 'malformed JSON body' });
+              return;
+            }
+          }
+          const reply: RestReply = routeRest({
+            store,
+            method,
+            segments,
+            query,
+            body,
+            host: req.headers.host ?? 'localhost',
+          });
+          send(res, reply.status, reply.body, JSON_TYPE, reply.headers ?? {});
+          return;
+        }
+
+        notFound(res);
+      } catch (error) {
+        // A request handler must never take the server down with it.
+        if (!res.headersSent) {
+          sendJson(res, 500, { message: error instanceof Error ? error.message : 'internal error' });
+        } else {
+          res.destroy();
+        }
       }
     })();
   });
-}
-
-/** Split a raw request target into path + query map, skipping the URL parser when
- *  there is no query string at all (the common case for the timed workloads). */
-function splitTarget(raw: string): { path: string; params: Record<string, string> } {
-  const q = raw.indexOf('?');
-  if (q === -1) return { path: raw, params: {} };
-  const params: Record<string, string> = {};
-  try {
-    const parsed = new URL(raw, 'http://entry');
-    parsed.searchParams.forEach((v, k) => {
-      if (!(k in params)) params[k] = v;
-    });
-    return { path: parsed.pathname, params };
-  } catch {
-    return { path: raw.slice(0, q), params };
-  }
-}
-
-async function routeRequest(store: Forge, request: IncomingMessage, response: ServerResponse): Promise<void> {
-  const verb = request.method ?? 'GET';
-  const rawTarget = request.url ?? '/';
-  const { path: route, params } = splitTarget(rawTarget);
-  const base = `http://${request.headers.host ?? '127.0.0.1'}`;
-  const authed = readBearer(request) !== '';
-
-  // Liveness probe (the env's boot check calls it twice).
-  if (verb === 'GET' && route === '/healthz') {
-    writeJson(response, 200, { ok: true });
-    return;
-  }
-
-  // Git smart HTTP: /{owner}/{repo}.git/<verb> — info/refs, upload-pack, receive-pack.
-  // Only test the regex when the path actually mentions a .git/ repository.
-  if (route.includes('.git/')) {
-    const gitRoute = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(route);
-    if (gitRoute) {
-      const login = decodePart(gitRoute[1]!);
-      const slug = decodePart(gitRoute[2]!);
-      const tail = gitRoute[3]!;
-      if (!authed) {
-        writeJson(response, 401, { message: 'Requires authentication' });
-        return;
-      }
-      if (verb === 'GET' && tail === 'info/refs') {
-        const name = params.service ?? '';
-        const answer: GitResponse = handleInfoRefs(store, login, slug, name, request.headers['git-protocol']);
-        writeBuffer(response, answer.status, answer.contentType, answer.body);
-        return;
-      }
-      if (verb === 'POST' && tail === 'git-upload-pack') {
-        const raw = await readRequestBody(request);
-        const answer: GitResponse = handleUploadPack(store, login, slug, raw);
-        writeBuffer(response, answer.status, answer.contentType, answer.body);
-        return;
-      }
-      if (verb === 'POST' && tail === 'git-receive-pack') {
-        const raw = await readRequestBody(request);
-        const answer: GitResponse = handleReceivePack(store, login, slug, raw);
-        writeBuffer(response, answer.status, answer.contentType, answer.body);
-        return;
-      }
-      writeJson(response, 404, { message: 'Not Found' });
-      return;
-    }
-  }
-
-  // REST v3 surface.
-  if (route === '/api/v3' || route.startsWith('/api/v3/')) {
-    const suffix = route === '/api/v3' ? '' : route.slice('/api/v3/'.length);
-    const parts = suffix === '' ? [] : suffix.split('/').map(decodePart);
-    // GET carries no body; every other method may (DELETE /contents carries one).
-    const text = verb === 'GET' ? '' : (await readRequestBody(request)).toString('utf8');
-    let body: unknown;
-    if (text.trim() !== '') {
-      try {
-        body = JSON.parse(text) as unknown;
-      } catch {
-        body = undefined;
-      }
-    }
-    const answer: ApiResponse = handleRest(store, {
-      method: verb,
-      segments: parts,
-      query: params,
-      body,
-      rawBody: text,
-      origin: base,
-      authenticated: authed,
-    });
-    if (answer.status === 204) {
-      writeEmpty(response);
-      return;
-    }
-    if (Buffer.isBuffer(answer.body)) {
-      writeBuffer(response, answer.status, answer.headers?.['content-type'] ?? JSON_CONTENT_TYPE, answer.body);
-      return;
-    }
-    writeJson(response, answer.status, answer.body ?? {}, answer.headers ?? {});
-    return;
-  }
-
-  // GraphQL v4 surface.
-  if (route === '/api/graphql' && verb === 'POST') {
-    if (!authed) {
-      writeJson(response, 401, { message: 'Requires authentication' });
-      return;
-    }
-    const text = (await readRequestBody(request)).toString('utf8');
-    const answer = handleGraphQL(store, text);
-    writeJson(response, answer.status, answer.body);
-    return;
-  }
-  if (route === '/api/graphql') {
-    writeJson(response, 404, { message: 'Not Found' });
-    return;
-  }
-
-  // MCP surface.
-  if (route === '/mcp') {
-    if (verb === 'GET') {
-      writeJson(response, 405, { message: 'Method Not Allowed' });
-      return;
-    }
-    if (verb === 'DELETE') {
-      // A legacy session goodbye: nothing is held, so it is a no-op.
-      response.writeHead(204, { 'x-github-request-id': nextRequestId() });
-      response.end();
-      return;
-    }
-    if (verb !== 'POST') {
-      writeJson(response, 405, { message: 'Method Not Allowed' });
-      return;
-    }
-    const text = (await readRequestBody(request)).toString('utf8');
-    const answer = handleMcp(store, text, authed);
-    if (answer.body === null) {
-      response.writeHead(answer.status, { 'x-github-request-id': nextRequestId() });
-      response.end();
-      return;
-    }
-    writeJson(response, answer.status, answer.body);
-    return;
-  }
-
-  writeJson(response, 404, { message: 'Not Found' });
 }
