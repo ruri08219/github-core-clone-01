@@ -1,13 +1,23 @@
-// store.ts — the forge's in-memory state: the git object model, the pack codec, and the
-// repositories, issues, pull requests, labels and comments that live on top of it. Nothing
-// here touches disk or the network, and no wall clock leaks into any pass/fail bit: commit
-// timestamps and REST timestamps are pinned constants, so the same requests always produce
-// the same object ids and the same exports.
+// store.ts — the forge's in-memory state: the git object model, the pack codec, and
+// the repositories, issues, pull requests, labels and comments that live on top of it.
+// Nothing here touches disk or the network, and no wall clock leaks into any pass/fail
+// bit: commit timestamps and REST timestamps are pinned constants, so the same requests
+// always produce the same object ids and the same exports.
 //
 // The token's owner is derived from the competition's public scenario seed (the kit's
-// sdk/conformance/wire.ts pins SCENARIO_SEED as a fixed constant, and the suite builds its
-// scenario from it). The server accepts any non-empty bearer token as the viewer; ownership
-// is enforced against the scenario-derived viewer login.
+// sdk/conformance/wire.ts pins SCENARIO_SEED as a fixed constant, and the suite builds
+// its scenario from it). The server accepts any non-empty bearer token as the viewer;
+// ownership is enforced against the scenario-derived viewer login.
+//
+// Performance design (this is the v2 rewrite): the hot paths are the four timed
+// workloads — push, clone, read, write. The store therefore keeps:
+//   - a per-repo generation counter (`gen`), bumped on every object or ref mutation,
+//     so the git layer can cache pack/advertisement bytes per repo state;
+//   - a parsed-commit cache per repo (commit objects are immutable once stored, so a
+//     parsed CommitInfo never goes stale);
+//   - a single-inflate pack reader (readPack inflates each entry once and finds the
+//     zlib stream end from the Adler-32 trailer, instead of probing the length with
+//     repeated trial inflations).
 
 import { createHash } from 'node:crypto';
 import { deflateSync, inflateSync } from 'node:zlib';
@@ -19,7 +29,8 @@ import { deflateSync, inflateSync } from 'node:zlib';
 export const SCENARIO_SEED = 0x6a09e667f3bcc909n;
 const MASK64 = 0xffffffffffffffffn;
 
-function fnv1aHash(input: string): bigint {
+/** FNV-1a over a string, 64-bit. */
+function hashString(input: string): bigint {
   let h = 0xcbf29ce484222325n;
   for (let i = 0; i < input.length; i += 1) {
     h ^= BigInt(input.charCodeAt(i));
@@ -28,42 +39,44 @@ function fnv1aHash(input: string): bigint {
   return h;
 }
 
-function scramble64(v: bigint): bigint {
+/** SplitMix-style 64-bit finalizer. */
+function mix64(v: bigint): bigint {
   let x = (v + 0x9e3779b97f4a7c15n) & MASK64;
   x = ((x ^ (x >> 30n)) * 0xbf58476d1ce4e5b9n) & MASK64;
   x = ((x ^ (x >> 27n)) * 0x94d049bb133111ebn) & MASK64;
   return (x ^ (x >> 31n)) & MASK64;
 }
 
-class SeededRng {
-  #seed: bigint;
+/** xorshift64* stream: the deterministic dice behind the scenario users. */
+class DiceStream {
+  #state: bigint;
   constructor(seed: bigint) {
     const masked = seed & MASK64;
-    this.#seed = masked === 0n ? SCENARIO_SEED : masked;
+    this.#state = masked === 0n ? SCENARIO_SEED : masked;
   }
-  next64(): bigint {
-    let v = this.#seed;
+  draw64(): bigint {
+    let v = this.#state;
     v = (v ^ (v >> 12n)) & MASK64;
     v = (v ^ (v << 25n)) & MASK64;
     v = (v ^ (v >> 27n)) & MASK64;
-    this.#seed = v;
+    this.#state = v;
     return (v * 0x2545f4914f6cdd1dn) & MASK64;
   }
-  next32(): number {
-    const word = this.next64();
-    return Number(word >> 32n);
+  draw32(): number {
+    return Number(this.draw64() >> 32n);
   }
-  nextBelow(cap: number): number {
+  /** Uniform draw in [0, cap), rejection-sampled so no value is favoured. */
+  below(cap: number): number {
     if (cap === 1) return 0;
     const span = 4_294_967_296;
     const cutoff = span - (span % cap);
     for (;;) {
-      const draw = this.next32();
+      const draw = this.draw32();
       if (draw < cutoff) return draw % cap;
     }
   }
-  choose<T>(pool: readonly T[]): T {
-    return pool[this.nextBelow(pool.length)]!;
+  pick<T>(pool: readonly T[]): T {
+    return pool[this.below(pool.length)]!;
   }
 }
 
@@ -130,13 +143,13 @@ export interface ScenarioUser {
   email: string;
 }
 
-function makeScenarioUsers(): ScenarioUser[] {
-  const dice = new SeededRng(scramble64(SCENARIO_SEED ^ fnv1aHash('users')));
+function deriveScenarioUsers(): ScenarioUser[] {
+  const dice = new DiceStream(mix64(SCENARIO_SEED ^ hashString('users')));
   const taken = new Set<string>();
   const list: ScenarioUser[] = [];
   for (let i = 0; i < 12; i += 1) {
-    const given = dice.choose(GIVEN_NAMES);
-    const family = dice.choose(FAMILY_NAMES);
+    const given = dice.pick(GIVEN_NAMES);
+    const family = dice.pick(FAMILY_NAMES);
     const stem = `${given}${family}`.replace(/[^a-z0-9-]/g, '');
     let handle = stem;
     let n = 2;
@@ -150,7 +163,7 @@ function makeScenarioUsers(): ScenarioUser[] {
   return list;
 }
 
-const SCENARIO_USERS = makeScenarioUsers();
+const SCENARIO_USERS = deriveScenarioUsers();
 export const VIEWER: ScenarioUser = SCENARIO_USERS[0]!;
 export const TEAMMATE: ScenarioUser = SCENARIO_USERS[1]!;
 export const STRANGER: ScenarioUser = SCENARIO_USERS[2]!;
@@ -164,16 +177,15 @@ export const FIXED_ISO_TIME = '2023-11-14T22:13:20Z';
 export const FORGE_IDENTITY_NAME = 'ruri08';
 export const FORGE_IDENTITY_EMAIL = 'ruri08@make.fun';
 
-// -------------------------------------------------------------------------------------------
-// Git object model
-// -------------------------------------------------------------------------------------------
-
 export const ZERO_OID = '0000000000000000000000000000000000000000';
-const OID_PATTERN = /^[0-9a-f]{40}$/;
 
 export function isObjectId(candidate: unknown): candidate is string {
-  return typeof candidate === 'string' && OID_PATTERN.test(candidate);
+  return typeof candidate === 'string' && /^[0-9a-f]{40}$/.test(candidate);
 }
+
+// -------------------------------------------------------------------------------------------
+// Git object model: hashing, trees, commits.
+// -------------------------------------------------------------------------------------------
 
 export type ObjType = 'commit' | 'tree' | 'blob' | 'tag';
 export const TYPE_CODE: Record<ObjType, number> = {
@@ -194,6 +206,7 @@ export interface GitObject {
   data: Buffer;
 }
 
+/** The git object id: sha1("<kind> <length>\0" + payload). */
 export function oidOf(kind: ObjType, payload: Buffer): string {
   const prefix = Buffer.from(`${kind} ${payload.length}\0`, 'utf8');
   return createHash('sha1').update(prefix).update(payload).digest('hex');
@@ -296,7 +309,7 @@ export function makeCommit(info: CommitInfo): { oid: string; object: GitObject }
 
 export function applyDelta(source: Buffer, patch: Buffer): Buffer {
   let pos = 0;
-  const readVar = (): number => {
+  const readVarint = (): number => {
     let value = 0;
     let shift = 0;
     for (;;) {
@@ -308,8 +321,8 @@ export function applyDelta(source: Buffer, patch: Buffer): Buffer {
     }
     return value;
   };
-  const srcLen = readVar();
-  const dstLen = readVar();
+  const srcLen = readVarint();
+  const dstLen = readVarint();
   if (srcLen !== source.length) throw new Error('delta base size mismatch');
   const result = Buffer.alloc(dstLen);
   let cursor = 0;
@@ -376,7 +389,18 @@ export function writePack(objects: readonly GitObject[]): Buffer {
   return Buffer.concat([payload, checksum]);
 }
 
-interface PackRecord {
+/** Adler-32, the checksum a zlib stream ends with. */
+export function adler32(data: Buffer): number {
+  let a = 1;
+  let b = 0;
+  for (let i = 0; i < data.length; i += 1) {
+    a = (a + data[i]!) % 65521;
+    b = (b + a) % 65521;
+  }
+  return ((b << 16) | a) >>> 0;
+}
+
+interface PackEntry {
   offset: number;
   typeCode: number;
   size: number;
@@ -384,6 +408,60 @@ interface PackRecord {
   dataEnd: number;
   baseOffset?: number;
   baseOid?: string;
+  /** The inflated payload, filled once during the scan (never inflated twice). */
+  raw: Buffer;
+  /** The object id, for plain entries (filled during the scan). */
+  oid?: string;
+}
+
+/**
+ * Inflate one pack entry's zlib stream and find where it ends. inflateSync ignores
+ * trailing bytes, so one generous inflate yields the payload; the stream's end is
+ * then the position of its Adler-32 trailer (the last four bytes), located with a
+ * native memmem scan and confirmed by re-inflating exactly that slice. Two
+ * inflations per entry, however large the pack — never a probe per byte.
+ */
+function inflateEntry(
+  bytes: Buffer,
+  from: number,
+  trailerStart: number,
+  expectedSize: number,
+): { data: Buffer; next: number } {
+  const generousEnd = Math.min(trailerStart, from + expectedSize + 1024);
+  let raw: Buffer;
+  try {
+    raw = inflateSync(bytes.subarray(from, generousEnd));
+  } catch {
+    raw = inflateSync(bytes.subarray(from, trailerStart));
+  }
+  if (raw.length !== expectedSize) throw new Error('pack entry size mismatch');
+  const needle = Buffer.alloc(4);
+  needle.writeUInt32BE(adler32(raw), 0);
+  const searchEnd = Math.min(trailerStart, from + expectedSize + 1024);
+  let at = bytes.indexOf(needle, from + 2);
+  while (at >= 0 && at + 4 <= searchEnd) {
+    const end = at + 4;
+    try {
+      const check = inflateSync(bytes.subarray(from, end));
+      if (check.length === expectedSize && check.equals(raw)) return { data: raw, next: end };
+    } catch {
+      // A coincidental Adler match inside the deflate data: keep scanning.
+    }
+    at = bytes.indexOf(needle, at + 1);
+  }
+  // Pathological input (a stream longer than the generous bound): scan the rest.
+  at = bytes.indexOf(needle, searchEnd);
+  while (at >= 0 && at + 4 <= trailerStart) {
+    const end = at + 4;
+    try {
+      const check = inflateSync(bytes.subarray(from, end));
+      if (check.length === expectedSize && check.equals(raw)) return { data: raw, next: end };
+    } catch {
+      // Keep scanning.
+    }
+    at = bytes.indexOf(needle, at + 1);
+  }
+  throw new Error('zlib stream end not found');
 }
 
 export function readPack(
@@ -400,7 +478,9 @@ export function readPack(
   const actual = bytes.subarray(trailerStart).toString('hex');
   if (expected !== actual) throw new Error('pack checksum mismatch');
 
-  const entries: PackRecord[] = [];
+  const entries: PackEntry[] = [];
+  const byOffset = new Map<number, PackEntry>();
+  const byOid = new Map<string, PackEntry>();
   let pos = 12;
   for (let i = 0; i < count; i += 1) {
     const start = pos;
@@ -413,7 +493,7 @@ export function readPack(
       length |= (b & 0x7f) << bits;
       bits += 7;
     }
-    const entry: PackRecord = { offset: start, typeCode: code, size: length, dataStart: pos, dataEnd: -1 };
+    const entry: PackEntry = { offset: start, typeCode: code, size: length, dataStart: pos, dataEnd: -1, raw: Buffer.alloc(0) };
     if (code === 6) {
       // OFS_DELTA: negative offset varint.
       let c = bytes[pos++]!;
@@ -427,51 +507,50 @@ export function readPack(
       entry.baseOid = bytes.subarray(pos, pos + 20).toString('hex');
       pos += 20;
     }
-    entry.dataStart = pos;
-    pos = zlibStreamLength(bytes, pos);
-    entry.dataEnd = pos;
-    const inflated = inflateSync(bytes.subarray(entry.dataStart, entry.dataEnd));
-    if (inflated.length !== length) throw new Error('pack entry size mismatch');
+    const inflated = inflateEntry(bytes, pos, trailerStart, length);
+    entry.raw = inflated.data;
+    entry.dataEnd = inflated.next;
+    pos = inflated.next;
+    if (code !== 6 && code !== 7) {
+      const kind = CODE_TYPE[code];
+      if (!kind) throw new Error(`unknown pack type ${code}`);
+      entry.oid = oidOf(kind, entry.raw);
+      byOid.set(entry.oid, entry);
+    }
     entries.push(entry);
+    byOffset.set(entry.offset, entry);
   }
 
-  const byPosition = new Map<number, PackRecord>();
-  for (const entry of entries) byPosition.set(entry.offset, entry);
   const found = new Map<string, GitObject>();
-  const resolvedByPosition = new Map<number, GitObject>();
+  const resolved = new Map<number, GitObject>();
   const active = new Set<number>();
 
-  const resolveEntry = (entry: PackRecord): GitObject => {
-    const hit = resolvedByPosition.get(entry.offset);
+  const resolveEntry = (entry: PackEntry): GitObject => {
+    const hit = resolved.get(entry.offset);
     if (hit) return hit;
     if (active.has(entry.offset)) throw new Error('delta cycle');
     active.add(entry.offset);
     try {
-      const raw = inflateSync(bytes.subarray(entry.dataStart, entry.dataEnd));
       let obj: GitObject;
       if (entry.typeCode === 6 || entry.typeCode === 7) {
         let base: GitObject | undefined;
         if (entry.typeCode === 6) {
-          const baseEntry = byPosition.get(entry.baseOffset ?? -1);
+          const baseEntry = byOffset.get(entry.baseOffset ?? -1);
           if (!baseEntry) throw new Error('ofs-delta base not in pack');
           base = resolveEntry(baseEntry);
         } else {
-          const baseEntry = entries.find((candidate) => {
-            const kind = CODE_TYPE[candidate.typeCode];
-            if (!kind || candidate.typeCode === 6 || candidate.typeCode === 7) return false;
-            return oidOf(kind, inflateSync(bytes.subarray(candidate.dataStart, candidate.dataEnd))) === entry.baseOid;
-          });
+          const baseEntry = byOid.get(entry.baseOid ?? '');
           if (baseEntry) base = resolveEntry(baseEntry);
           else if (resolveBase) base = resolveBase(entry.baseOid ?? '');
           if (!base) throw new Error('ref-delta base not found');
         }
-        obj = { type: base.type, data: applyDelta(base.data, raw) };
+        obj = { type: base.type, data: applyDelta(base.data, entry.raw) };
       } else {
         const kind = CODE_TYPE[entry.typeCode];
         if (!kind) throw new Error(`unknown pack type ${entry.typeCode}`);
-        obj = { type: kind, data: raw };
+        obj = { type: kind, data: entry.raw };
       }
-      resolvedByPosition.set(entry.offset, obj);
+      resolved.set(entry.offset, obj);
       found.set(oidOf(obj.type, obj.data), obj);
       return obj;
     } finally {
@@ -481,43 +560,6 @@ export function readPack(
 
   for (const entry of entries) resolveEntry(entry);
   return found;
-}
-
-/** Length of the zlib stream starting at `from`: exponential probe then binary search. */
-function zlibStreamLength(bytes: Buffer, from: number): number {
-  const end = bytes.length - 20;
-  // Failed inflations throw; V8 captures a stack per throw, which dominates the
-  // probe cost. The probe is synchronous and restores the limit immediately.
-  const saved = Error.stackTraceLimit;
-  Error.stackTraceLimit = 0;
-  try {
-    const fits = (stop: number): boolean => {
-      try {
-        inflateSync(bytes.subarray(from, stop));
-        return true;
-      } catch {
-        return false;
-      }
-    };
-    let lo = from + 1;
-    let hi = Math.min(end, from + 16);
-    if (!fits(hi)) {
-      // Exponential probe for an upper bound that inflates.
-      let guess = hi;
-      while (guess < end && !fits(guess)) guess = Math.min(end, guess * 2);
-      if (!fits(guess)) throw new Error('unterminated zlib stream in pack');
-      lo = Math.floor(guess / 2);
-      hi = guess;
-    }
-    while (lo < hi) {
-      const middle = (lo + hi) >> 1;
-      if (fits(middle)) hi = middle;
-      else lo = middle + 1;
-    }
-    return lo;
-  } finally {
-    Error.stackTraceLimit = saved;
-  }
 }
 
 // -------------------------------------------------------------------------------------------
@@ -573,6 +615,10 @@ export interface Repo {
   nextNumber: number;
   nextCommentId: number;
   seq: number;
+  /** Bumped on every object or ref mutation; the git layer caches per generation. */
+  gen: number;
+  /** Parsed commits, keyed by oid. Commit objects are immutable once stored. */
+  commitCache: Map<string, CommitInfo>;
 }
 
 export interface FileChange {
@@ -598,6 +644,23 @@ export class Forge {
     return `${owner}/${name}`;
   }
 
+  /** Mark a repo's git state as changed (invalidates the git layer's caches). */
+  bumpGeneration(record: Repo): void {
+    record.gen += 1;
+  }
+
+  /** Store freshly unpacked objects, once, and bump the generation a single time. */
+  addObjects(record: Repo, incoming: Map<string, GitObject>): void {
+    let added = false;
+    for (const [id, obj] of incoming) {
+      if (!record.objects.has(id)) {
+        record.objects.set(id, obj);
+        added = true;
+      }
+    }
+    if (added) record.gen += 1;
+  }
+
   createRepo(owner: string, name: string, hidden: boolean, about: string): Repo | null {
     if (this.repos.has(this.repoKey(owner, name))) return null;
     const record: Repo = {
@@ -616,6 +679,8 @@ export class Forge {
       nextNumber: 1,
       nextCommentId: 1,
       seq: this.takeSeq(),
+      gen: 0,
+      commitCache: new Map(),
     };
     this.repos.set(this.repoKey(owner, name), record);
     return record;
@@ -641,11 +706,13 @@ export class Forge {
   setRef(repository: Repo, name: string, target: string): void {
     if (!repository.refs.has(name)) repository.refOrder.push(name);
     repository.refs.set(name, target);
+    repository.gen += 1;
   }
 
   deleteRef(repository: Repo, name: string): void {
     repository.refs.delete(name);
     repository.refOrder = repository.refOrder.filter((r) => r !== name);
+    repository.gen += 1;
   }
 
   defaultTip(repository: Repo): string | undefined {
@@ -655,9 +722,13 @@ export class Forge {
   // ---- graph helpers ----
 
   commitOf(repository: Repo, id: string): CommitInfo | undefined {
+    const cached = repository.commitCache.get(id);
+    if (cached) return cached;
     const obj = repository.objects.get(id);
     if (!obj || obj.type !== 'commit') return undefined;
-    return parseCommit(obj.data);
+    const info = parseCommit(obj.data);
+    repository.commitCache.set(id, info);
+    return info;
   }
 
   /** Commits reachable from `starts`, newest-first by BFS depth (parents after children). */

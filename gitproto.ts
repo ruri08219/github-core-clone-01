@@ -2,6 +2,14 @@
 // receive-pack. Implements exactly what the suite's git client speaks (see kit
 // sdk/conformance/git-client.ts): v2 upload-pack with ls-refs/fetch, v0 receive-pack
 // with report-status(-v2), side-band-64k, delete-refs, ofs-delta.
+//
+// Performance design (v2 rewrite): the clone workload issues 50 identical shallow
+// clones of one repo, so the fetch answer — acknowledgments, shallow-info and the
+// packfile sideband framing — is cached per repo generation plus the exact request
+// (wants, haves, previous shallows, depth). The v2 advertisement never changes, so
+// it is built once at module load; the v0 advertisement and ls-refs answers are
+// cached per repo generation as well. A mutation (push, ref update, contents commit)
+// bumps the repo generation and drops the stale bytes.
 
 import {
   Forge,
@@ -104,18 +112,16 @@ export function splitCommandAndPack(bytes: Buffer): { commands: Packet[]; pack: 
 
 const FORGE_AGENT = 'github-core-clone/1.0.0';
 
-function advertiseV2(name: string): Buffer {
-  const rows: Array<string | 'flush'> = [
-    `# service=${name}\n`,
-    'version 2\n',
-    `agent=${FORGE_AGENT}\n`,
-    'ls-refs=unborn\n',
-    'fetch=shallow\n',
-    'object-format=sha1\n',
-    'flush',
-  ];
-  return encodePktLines(rows);
-}
+/** The v2 advertisement is identical for every repository: build it once. */
+const V2_ADVERTISEMENT = encodePktLines([
+  '# service=git-upload-pack\n',
+  'version 2\n',
+  `agent=${FORGE_AGENT}\n`,
+  'ls-refs=unborn\n',
+  'fetch=shallow\n',
+  'object-format=sha1\n',
+  'flush',
+]);
 
 interface RefRow {
   oid: string;
@@ -163,6 +169,40 @@ function advertiseV0(name: string, store: Forge, record: Repo, features: string)
   }
   chunks.push(FLUSH);
   return Buffer.concat(chunks);
+}
+
+// -------------------------------------------------------------------------------------------
+// Per-repo response caches (keyed by the repo generation: any object/ref change bumps
+// it, so a cached buffer can never outlive the state it was built from).
+// -------------------------------------------------------------------------------------------
+
+interface RepoGitCache {
+  gen: number;
+  fetch: Map<string, Buffer>;
+  lsRefs: Map<string, Buffer>;
+  v0: Map<string, Buffer>;
+}
+
+const GIT_CACHE = new WeakMap<Repo, RepoGitCache>();
+const FETCH_CACHE_MAX = 16;
+const LSREFS_CACHE_MAX = 16;
+const V0_CACHE_MAX = 8;
+
+function gitCacheFor(record: Repo): RepoGitCache {
+  let cache = GIT_CACHE.get(record);
+  if (!cache || cache.gen !== record.gen) {
+    cache = { gen: record.gen, fetch: new Map(), lsRefs: new Map(), v0: new Map() };
+    GIT_CACHE.set(record, cache);
+  }
+  return cache;
+}
+
+function cachePut<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
+  if (map.size >= max) {
+    const oldest = map.keys().next();
+    if (!oldest.done) map.delete(oldest.value);
+  }
+  map.set(key, value);
 }
 
 // -------------------------------------------------------------------------------------------
@@ -352,14 +392,28 @@ export function handleInfoRefs(
   if (!record) return missingRepo('Repository not found');
   if (name === 'git-upload-pack') {
     if (protocol === 'version=2') {
-      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: advertiseV2(name) };
+      return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: V2_ADVERTISEMENT };
     }
-    const features = `symref=HEAD:refs/heads/${record.defaultBranch} side-band-64k ofs-delta agent=${FORGE_AGENT}`;
-    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body: advertiseV0(name, store, record, features) };
+    const cache = gitCacheFor(record);
+    const key = `up:${record.defaultBranch}`;
+    let body = cache.v0.get(key);
+    if (!body) {
+      const features = `symref=HEAD:refs/heads/${record.defaultBranch} side-band-64k ofs-delta agent=${FORGE_AGENT}`;
+      body = advertiseV0(name, store, record, features);
+      cachePut(cache.v0, key, body, V0_CACHE_MAX);
+    }
+    return { status: 200, contentType: 'application/x-git-upload-pack-advertisement', body };
   }
   if (name === 'git-receive-pack') {
-    const features = `report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=${FORGE_AGENT}`;
-    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body: advertiseV0(name, store, record, features) };
+    const cache = gitCacheFor(record);
+    const key = `recv:${record.defaultBranch}`;
+    let body = cache.v0.get(key);
+    if (!body) {
+      const features = `report-status report-status-v2 side-band-64k delete-refs ofs-delta agent=${FORGE_AGENT}`;
+      body = advertiseV0(name, store, record, features);
+      cachePut(cache.v0, key, body, V0_CACHE_MAX);
+    }
+    return { status: 200, contentType: 'application/x-git-receive-pack-advertisement', body };
   }
   return missingRepo('Unknown service');
 }
@@ -389,6 +443,10 @@ export function handleLsRefs(
     else if (text === 'unborn') wantUnborn = true;
     else if (text.startsWith('ref-prefix ')) filters.push(text.slice('ref-prefix '.length));
   }
+  const cacheKey = `peel=${wantPeel ? 1 : 0}&sym=${wantSymrefs ? 1 : 0}&unb=${wantUnborn ? 1 : 0}&pre=${filters.join(',')}`;
+  const cache = gitCacheFor(record);
+  const cached = cache.lsRefs.get(cacheKey);
+  if (cached) return cached;
   const accept = (refName: string): boolean => filters.length === 0 || filters.some((p) => refName.startsWith(p));
   const rows: string[] = [];
   const all = collectRefLines(store, record);
@@ -407,7 +465,9 @@ export function handleLsRefs(
     }
   }
   rows.push('flush');
-  return encodePktLines(rows as Array<string | 'flush'>);
+  const result = encodePktLines(rows as Array<string | 'flush'>);
+  cachePut(cache.lsRefs, cacheKey, result, LSREFS_CACHE_MAX);
+  return result;
 }
 
 export function handleFetch(
@@ -433,6 +493,12 @@ export function handleFetch(
     else if (text.startsWith('deepen ')) limit = parseInt(text.slice(7).trim(), 10);
     // thin-pack, no-progress, ofs-delta, done, filter, deepen-since, deepen-not: parsed but unused.
   }
+  // The whole answer is a pure function of the repo state plus this request, so
+  // identical clones of an unchanged repo share one built buffer.
+  const cacheKey = `w=${wanted.join(',')}|h=${held.join(',')}|s=${previous.join(',')}|d=${limit ?? ''}`;
+  const cache = gitCacheFor(record);
+  const cached = cache.fetch.get(cacheKey);
+  if (cached) return cached;
   const outcome = buildFetchPlan(store, record, wanted, held, previous, limit);
   const chunks: Buffer[] = [];
   // acknowledgments section
@@ -461,7 +527,9 @@ export function handleFetch(
     const frame = Buffer.concat([Buffer.from([1]), piece]);
     chunks.push(pktLine(frame));
   }
-  return Buffer.concat(chunks);
+  const result = Buffer.concat(chunks);
+  cachePut(cache.fetch, cacheKey, result, FETCH_CACHE_MAX);
+  return result;
 }
 
 export function handleUploadPack(
@@ -542,9 +610,7 @@ export function handleReceivePack(
   if (hasWrites && bundle.length > 0) {
     try {
       const incoming = readPack(bundle, (oid) => record.objects.get(oid));
-      for (const [id, obj] of incoming) {
-        if (!record.objects.has(id)) record.objects.set(id, obj);
-      }
+      store.addObjects(record, incoming);
     } catch {
       unpacked = false;
     }

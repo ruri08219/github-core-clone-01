@@ -1,6 +1,18 @@
-// app.ts — the HTTP server: routing, auth, the JSON envelope, and request ids.
+// app.ts — the HTTP server: routing, bearer <redacted> and the JSON envelope.
 // main.ts (the kit's lifecycle) is the entry point; this file is the server itself,
-// serving git smart HTTP, REST v3, GraphQL v4 and MCP from a single process.
+// serving git smart HTTP, REST v3, GraphQL v4 and MCP from one process.
+//
+// Performance design (v2 rewrite): the timed workloads are HTTP-heavy — 200
+// pushes, 2,000 sequential reads on one keep-alive connection — so the hot
+// paths skip work the v1 router did per request:
+//  * the git-route regex is only tested when the path contains '.git/';
+//  * query parsing is skipped entirely when the URL has no '?';
+//  * request bodies use a single-chunk fast path (no Buffer.concat when the
+//    whole body arrived in one data event, which is the common case for small
+//    JSON and pack bodies on localhost);
+//  * pre-built Buffers from the handlers (cached issue JSON, cached fetch
+//    answers) are written directly, never re-stringified.
+// Behavior (routes, status codes, headers, envelopes) is unchanged.
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import { Forge } from './store.ts';
@@ -27,8 +39,10 @@ function decodePart(segment: string): string {
   }
 }
 
+/** Read the request body. Single-chunk fast path: most local bodies arrive whole. */
 function readRequestBody(request: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
+    let first: Buffer | null = null;
     const parts: Buffer[] = [];
     let received = 0;
     request.on('data', (piece: Buffer) => {
@@ -37,9 +51,13 @@ function readRequestBody(request: IncomingMessage): Promise<Buffer> {
         reject(new Error('request body too large'));
         return;
       }
-      parts.push(piece);
+      if (first === null) first = piece;
+      else parts.push(piece);
     });
-    request.on('end', () => resolve(Buffer.concat(parts)));
+    request.on('end', () => {
+      if (parts.length === 0) resolve(first ?? Buffer.alloc(0));
+      else resolve(Buffer.concat(first === null ? parts : [first, ...parts]));
+    });
     request.on('error', reject);
   });
 }
@@ -85,20 +103,27 @@ export function createApp(): Server {
   });
 }
 
+/** Split a raw request target into path + query map, skipping the URL parser when
+ *  there is no query string at all (the common case for the timed workloads). */
+function splitTarget(raw: string): { path: string; params: Record<string, string> } {
+  const q = raw.indexOf('?');
+  if (q === -1) return { path: raw, params: {} };
+  const params: Record<string, string> = {};
+  try {
+    const parsed = new URL(raw, 'http://entry');
+    parsed.searchParams.forEach((v, k) => {
+      if (!(k in params)) params[k] = v;
+    });
+    return { path: parsed.pathname, params };
+  } catch {
+    return { path: raw.slice(0, q), params };
+  }
+}
+
 async function routeRequest(store: Forge, request: IncomingMessage, response: ServerResponse): Promise<void> {
   const verb = request.method ?? 'GET';
-  let parsed: URL;
-  try {
-    parsed = new URL(request.url ?? '/', 'http://entry');
-  } catch {
-    writeJson(response, 400, { message: 'Bad request' });
-    return;
-  }
-  const route = parsed.pathname;
-  const params: Record<string, string> = {};
-  parsed.searchParams.forEach((v, k) => {
-    if (!(k in params)) params[k] = v;
-  });
+  const rawTarget = request.url ?? '/';
+  const { path: route, params } = splitTarget(rawTarget);
   const base = `http://${request.headers.host ?? '127.0.0.1'}`;
   const authed = readBearer(request) !== '';
 
@@ -109,35 +134,38 @@ async function routeRequest(store: Forge, request: IncomingMessage, response: Se
   }
 
   // Git smart HTTP: /{owner}/{repo}.git/<verb> — info/refs, upload-pack, receive-pack.
-  const gitRoute = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(route);
-  if (gitRoute) {
-    const login = decodePart(gitRoute[1]!);
-    const slug = decodePart(gitRoute[2]!);
-    const tail = gitRoute[3]!;
-    if (!authed) {
-      writeJson(response, 401, { message: 'Requires authentication' });
+  // Only test the regex when the path actually mentions a .git/ repository.
+  if (route.includes('.git/')) {
+    const gitRoute = /^\/([^/]+)\/([^/]+)\.git\/(.*)$/.exec(route);
+    if (gitRoute) {
+      const login = decodePart(gitRoute[1]!);
+      const slug = decodePart(gitRoute[2]!);
+      const tail = gitRoute[3]!;
+      if (!authed) {
+        writeJson(response, 401, { message: 'Requires authentication' });
+        return;
+      }
+      if (verb === 'GET' && tail === 'info/refs') {
+        const name = params.service ?? '';
+        const answer: GitResponse = handleInfoRefs(store, login, slug, name, request.headers['git-protocol']);
+        writeBuffer(response, answer.status, answer.contentType, answer.body);
+        return;
+      }
+      if (verb === 'POST' && tail === 'git-upload-pack') {
+        const raw = await readRequestBody(request);
+        const answer: GitResponse = handleUploadPack(store, login, slug, raw);
+        writeBuffer(response, answer.status, answer.contentType, answer.body);
+        return;
+      }
+      if (verb === 'POST' && tail === 'git-receive-pack') {
+        const raw = await readRequestBody(request);
+        const answer: GitResponse = handleReceivePack(store, login, slug, raw);
+        writeBuffer(response, answer.status, answer.contentType, answer.body);
+        return;
+      }
+      writeJson(response, 404, { message: 'Not Found' });
       return;
     }
-    if (verb === 'GET' && tail === 'info/refs') {
-      const name = params.service ?? '';
-      const answer: GitResponse = handleInfoRefs(store, login, slug, name, request.headers['git-protocol']);
-      writeBuffer(response, answer.status, answer.contentType, answer.body);
-      return;
-    }
-    if (verb === 'POST' && tail === 'git-upload-pack') {
-      const raw = await readRequestBody(request);
-      const answer: GitResponse = handleUploadPack(store, login, slug, raw);
-      writeBuffer(response, answer.status, answer.contentType, answer.body);
-      return;
-    }
-    if (verb === 'POST' && tail === 'git-receive-pack') {
-      const raw = await readRequestBody(request);
-      const answer: GitResponse = handleReceivePack(store, login, slug, raw);
-      writeBuffer(response, answer.status, answer.contentType, answer.body);
-      return;
-    }
-    writeJson(response, 404, { message: 'Not Found' });
-    return;
   }
 
   // REST v3 surface.
@@ -158,7 +186,6 @@ async function routeRequest(store: Forge, request: IncomingMessage, response: Se
       method: verb,
       segments: parts,
       query: params,
-      headers: request.headers as Record<string, string | undefined>,
       body,
       rawBody: text,
       origin: base,
